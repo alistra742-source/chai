@@ -190,6 +190,11 @@ footer b { color: var(--txt); }
   border: 1px solid var(--amber); border-radius: 8px; padding: 8px 10px;
   background: rgba(20,14,2,.5); font-family: ui-monospace, Consolas, monospace;
 }
+#runThrottle {
+  margin: 10px 0 0; color: var(--amber);
+  border: 1px dashed var(--amber); border-radius: 8px; padding: 8px 10px;
+  background: rgba(20,14,2,.3); font-family: ui-monospace, Consolas, monospace;
+}
 
 /* ------------------------- exit IP / Tor rotation ------------------------ */
 #proxyList { margin-top: 10px; }

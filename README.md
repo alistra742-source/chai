@@ -112,6 +112,28 @@ user/pass auth, CONNECT), HTTP proxies via `CONNECT`, per-request agents, and
 the Tor control protocol. `lib/http.js` is a small `fetch`-alike used by every
 checker, so **server, browser-relayed and swarm** checks all go through it.
 
+`lib/http.js` also owns the things these sites need to answer at all:
+
+- **A cookie jar.** guns.lol answers `307` with `location` pointing at the
+  *same* url plus `set-cookie: guns_clearance=…`. A client that drops cookies
+  re-requests forever, so one username check became **six** requests — that is
+  where the `HTTP 429 (Cloudflare challenge?)` rows came from, and the `401`s
+  once a clearance cookie minted for one exit was replayed from another. The
+  cookie is stored per host and sent back, which turns the same check into
+  `200` + `Username not found`. Cookies are remembered *between* checks only
+  when the exit never changes (direct, or Tor without per-connection
+  isolation).
+- **One exit IP per check.** All redirect hops of a single check share one proxy
+  route, so a cookie minted on hop 1 is still valid on hop 2. Rotation still
+  happens per check, not per hop.
+- **Bounded retries.** `429 / 403 / 503` on a GET are retried (up to 3 attempts)
+  with backoff, honouring `Retry-After`, each attempt on a fresh route. POST is
+  never retried, so a Discord availability check can't be submitted twice.
+- **Adaptive back-off.** When the server engine sees a rate-limit/block from the
+  target, every worker pauses (2 s, doubling to 30 s, decaying again on healthy
+  answers) and the dashboard shows `⏸ … is throttling this IP` instead of a wall
+  of identical error rows.
+
 ```bash
 # torrc (or /etc/tor/torrc)
 SocksPort 9050 IsolateSOCKSAuth   # fresh circuit per SOCKS5 credential pair
@@ -143,9 +165,11 @@ keeps showing requests routed, new identities issued and exits seen.
   server-side proxy can route — use **server** or **swarm** for full Tor
   coverage.
 - Honest caveat: Tor exit nodes are widely blocked or rate-limited (Instagram,
-  TikTok and guns.lol's Cloudflare will often answer 403/429). Rotation helps
-  with per-IP limits, it does not make a blocked exit look residential — keep
-  the delay on, and prefer your own IP or a proxy list where Tor fails.
+  TikTok and guns.lol will often answer 403/429). Rotation helps with per-IP
+  limits, it does not make a blocked exit look residential — keep the delay on,
+  and prefer your own IP or a proxy list where Tor fails. Better still: leave
+  the route **off** for guns.lol on a normal connection now that the clearance
+  cookie is replayed — the 429s there were self-inflicted, not Cloudflare.
 
 Run the proxy test suite (mock SOCKS5 server, mock CONNECT proxy, mock Tor
 control port, real HTTPS through the tunnel):

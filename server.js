@@ -85,6 +85,8 @@ function newRun(cfg) {
     error: null,     // why a run died (e.g. swarm launch failure) — shown in the UI
     rateWindow: [],  // {t, n} for rolling rate
     lastErrors: [],
+    cooldownUntil: 0, // wall clock until which every worker pauses
+    throttleHits: 0,  // consecutive rate-limit/block answers (drives the backoff)
   };
 }
 
@@ -167,6 +169,12 @@ function stateSnapshot(state) {
       lastErrors: state.lastErrors.slice(10),
       concurrency: state.concurrency,
       delay: state.delay,
+      throttle: {
+        active: (state.cooldownUntil || 0) > Date.now(),
+        until: state.cooldownUntil || 0,
+        hits: state.throttleHits || 0,
+        waitMs: Math.max(0, (state.cooldownUntil || 0) - Date.now()),
+      },
     },
     platforms: platformMeta(),
     presets: PATTERN_PRESETS,
@@ -183,14 +191,39 @@ function platformMeta() {
 /* ------------------------------ engines ---------------------------------- */
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
+/* When a platform throttles or blocks us, every worker pauses instead of adding
+ * fuel to the fire. The wait grows with each consecutive hit and decays as
+ * answers come back healthy again. */
+const THROTTLE_BASE_MS = 2000;
+const THROTTLE_MAX_MS = 30000;
+
+function throttle(state) {
+  state.throttleHits = Math.min(6, (state.throttleHits || 0) + 1);
+  const wait = Math.min(THROTTLE_MAX_MS, THROTTLE_BASE_MS * Math.pow(2, state.throttleHits - 1));
+  state.cooldownUntil = Math.max(state.cooldownUntil || 0, Date.now() + wait);
+  return wait;
+}
+
 async function runServerEngine(state) {
   state.running = true;
   state.startedAt = Date.now();
   const cursor = { i: 0 };
   const nworkers = Math.max(1, Math.min(MAX_CONCURRENCY, state.concurrency || 5));
 
+  const pauseWhileCooling = async () => {
+    while (!state.abort) {
+      const wait = (state.cooldownUntil || 0) - Date.now();
+      if (wait <= 0) return;
+      await sleep(Math.min(wait, 1000));
+    }
+  };
+
   const worker = async () => {
     while (!state.abort) {
+      if ((state.cooldownUntil || 0) > Date.now()) {
+        await pauseWhileCooling();
+        if (state.abort) return;
+      }
       const i = cursor.i++;
       if (i >= state.total) return;
       const name = nameAt(state.target, state.order, i);
@@ -198,8 +231,10 @@ async function runServerEngine(state) {
       try {
         res = await liveCheck(state.platform, name);
       } catch (e) {
-        res = { status: 'error', http: 0, via: 'exception', note: String(e.message || e).slice(0, 140) };
+        res = { status: 'error', http: 0, via: 'exception', kind: e.kind, note: String(e.message || e).slice(0, 140) };
       }
+      if (res.status !== 'error') state.throttleHits = Math.max(0, state.throttleHits - 1);
+      else if (res.kind === 'ratelimited' || res.kind === 'blocked') throttle(state);
       record(state, name, res);
       if (state.delay > 0) {
         const jitter = state.delay * (0.7 + Math.random() * 0.6);

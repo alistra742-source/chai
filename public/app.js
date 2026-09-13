@@ -582,6 +582,17 @@ function render(snap) {
   const errEl = $('#runError');
   if (err) { errEl.hidden = false; errEl.textContent = '⚠ ' + err; } else { errEl.hidden = true; }
 
+  // the target is throttling/blocking us: every worker is paused, so the error
+  // rows stop instead of piling up. Say so, and point at the fix (delay/route).
+  const th = r.throttle || null;
+  const thEl = $('#runThrottle');
+  if (th && th.active) {
+    const left = Math.max(1, Math.ceil((th.waitMs || 0) / 1000));
+    thEl.textContent = `⏸ ${r.platform} is throttling this IP (hit ${th.hits}) — all workers paused ${left}s. `
+      + 'Raise the delay, or rotate the route (exit IP) in section 4.';
+    thEl.hidden = false;
+  } else thEl.hidden = true;
+
   // cam wall source of truth
   if (snap.swarm && snap.swarm.meta) {
     const label = '· 6× ' + (snap.swarm.meta.browser || 'real browser') + ' on host — LIVE VIDEO';

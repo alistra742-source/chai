@@ -158,12 +158,32 @@ async function startTorControl({ password = '', rejectAuth = false } = {}) {
 }
 
 /* ------------------------------ mock origin ------------------------------- */
+/* Also models the behaviour that was breaking real guns.lol checks: a 307 to
+ * the SAME url that mints a clearance cookie, and a throttled route. */
 async function startOrigin() {
+  const state = { hits: new Map() };
+  const bump = (url) => { const n = (state.hits.get(url) || 0) + 1; state.hits.set(url, n); return n; };
   const server = http.createServer((req, res) => {
-    if (req.url === '/redirect') { res.writeHead(302, { location: '/hello' }); return res.end(); }
-    if (req.url === '/hello') { res.writeHead(200, { 'content-type': 'text/plain' }); return res.end('hello world'); }
-    if (req.url === '/json') { res.writeHead(200, { 'content-type': 'application/json' }); return res.end(JSON.stringify({ ok: true })); }
-    if (req.url === '/echo') {
+    const url = req.url.split('?')[0];
+    const n = bump(url);
+    if (url === '/redirect') { res.writeHead(302, { location: '/hello' }); return res.end(); }
+    if (url === '/hello') { res.writeHead(200, { 'content-type': 'text/plain' }); return res.end('hello world'); }
+    if (url === '/json') { res.writeHead(200, { 'content-type': 'application/json' }); return res.end(JSON.stringify({ ok: true })); }
+    if (url === '/needs-cookie') {
+      if (!/clearance=1/.test(req.headers.cookie || '')) {
+        res.writeHead(307, { location: '/needs-cookie', 'set-cookie': 'clearance=1; Path=/' });
+        return res.end('go away');
+      }
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      return res.end('logged in');
+    }
+    if (url === '/flaky') {
+      if (n <= 2) { res.writeHead(429, { 'retry-after': '0.05' }); return res.end('slow down'); }
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      return res.end('finally');
+    }
+    if (url === '/always-429') { res.writeHead(429, { 'retry-after': '0.02' }); return res.end('no'); }
+    if (url === '/echo') {
       const chunks = [];
       req.on('data', c => chunks.push(c));
       req.on('end', () => {
@@ -175,7 +195,7 @@ async function startOrigin() {
     res.writeHead(404); res.end('nope');
   });
   const port = await listen(server);
-  return { port, close: () => server.close() };
+  return { port, state, close: () => server.close() };
 }
 
 /* ================================ tests ================================== */
@@ -208,6 +228,72 @@ async function startOrigin() {
     assert.strictEqual(await echoed.text(), body);
     const json = await fetchWithTimeout(`${originUrl}/json`, {}, 8000);
     assert.deepStrictEqual(await json.json(), { ok: true });
+  });
+
+  await test('a cookie-minting self-redirect is followed instead of storming (guns.lol shape)', async () => {
+    pool.setConfig({ mode: 'off' });
+    const before = origin.state.hits.get('/needs-cookie') || 0;
+    const res = await fetchWithTimeout(`${originUrl}/needs-cookie`, {}, 8000);
+    assert.strictEqual(res.status, 200, `expected 200 after the clearance redirect, got ${res.status}`);
+    assert.strictEqual(await res.text(), 'logged in');
+    assert.strictEqual((origin.state.hits.get('/needs-cookie') || 0) - before, 2,
+      'expected exactly one 307 + one 200, not a redirect storm');
+  });
+
+  await test('cookies are remembered between checks when the exit is stable', async () => {
+    // still in direct mode from the previous test: the clearance cookie must
+    // already be in the jar, so this check costs a single request
+    const before = origin.state.hits.get('/needs-cookie') || 0;
+    const res = await fetchWithTimeout(`${originUrl}/needs-cookie`, {}, 8000);
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual((origin.state.hits.get('/needs-cookie') || 0) - before, 1,
+      'the clearance cookie was not replayed from the jar');
+  });
+
+  await test('all redirect hops of one check share a single exit identity', async () => {
+    // rotating mode still needs ONE ip for the whole chain, or the clearance
+    // cookie minted on the first hop gets rejected on the second
+    pool.setConfig({ mode: 'tor', torSocks: `socks5://127.0.0.1:${socks.port}`, torControl: '', isolate: true });
+    const usersBefore = socks.state.users.length;
+    const res = await fetchWithTimeout(`${originUrl}/needs-cookie`, {}, 8000);
+    assert.strictEqual(res.status, 200, `got ${res.status}`);
+    const users = socks.state.users.slice(usersBefore);
+    assert.ok(users.length >= 2, `expected at least 2 tunnels for the chain, got ${users.length}`);
+    assert.strictEqual(new Set(users).size, 1, `the chain used ${new Set(users).size} exits instead of 1`);
+  });
+
+  await test('a rotating exit does not leak cookies into the next check', async () => {
+    const before = origin.state.hits.get('/needs-cookie') || 0;
+    const res = await fetchWithTimeout(`${originUrl}/needs-cookie`, {}, 8000);
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual((origin.state.hits.get('/needs-cookie') || 0) - before, 2,
+      'a clearance cookie minted for a previous exit was replayed');
+  });
+
+  await test('GET is retried on 429 and eventually succeeds', async () => {
+    pool.setConfig({ mode: 'off' });
+    const before = origin.state.hits.get('/flaky') || 0;
+    const res = await fetchWithTimeout(`${originUrl}/flaky`, {}, 8000);
+    assert.strictEqual(res.status, 200, `expected a retry to win, got ${res.status}`);
+    assert.strictEqual(await res.text(), 'finally');
+    assert.strictEqual((origin.state.hits.get('/flaky') || 0) - before, 3, 'expected 2 throttled attempts then a success');
+  });
+
+  await test('POST is never retried (no double submits)', async () => {
+    const before = origin.state.hits.get('/always-429') || 0;
+    const res = await fetchWithTimeout(`${originUrl}/always-429`, { method: 'POST', body: 'x' }, 8000);
+    assert.strictEqual(res.status, 429);
+    assert.strictEqual((origin.state.hits.get('/always-429') || 0) - before, 1, 'a POST was retried');
+  });
+
+  await test('identityStable() matches the configured rotation', async () => {
+    pool.setConfig({ mode: 'off' });
+    assert.strictEqual(pool.identityStable(), true, 'direct mode must be treatable as stable');
+    pool.setConfig({ mode: 'tor', torSocks: `socks5://127.0.0.1:${socks.port}`, isolate: false });
+    assert.strictEqual(pool.identityStable(), true, 'tor without isolation keeps one exit');
+    pool.setConfig({ isolate: true });
+    assert.strictEqual(pool.identityStable(), false, 'isolated circuits must not share cookies');
+    pool.setConfig({ mode: 'off' });
   });
 
   await test('socks5 mode tunnels plain HTTP through the proxy', async () => {
