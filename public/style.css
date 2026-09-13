@@ -81,7 +81,8 @@ main { display: grid; grid-template-columns: 430px 1fr; gap: 18px; padding: 18px
 .row output { font-family: ui-monospace, Consolas, monospace; color: var(--purple); }
 .chk { flex-direction: row !important; align-items: center !important; gap: 6px !important; }
 input[type=range] { accent-color: var(--red); width: 150px; }
-input[type=text], input:not([type]), textarea, select {
+label[hidden] { display: none !important; }
+input[type=text], input[type=password], input:not([type]), textarea, select {
   background: var(--panel2); color: var(--txt); border: 1px solid var(--line);
   border-radius: 8px; padding: 8px 10px; font: inherit; width: 100%;
 }
@@ -103,7 +104,7 @@ button.danger {
   font-weight: 800; padding: 12px 18px; border-radius: 10px; cursor: pointer;
 }
 button.danger:disabled { opacity: .35; cursor: not-allowed; }
-#singleBtn, .feed-actions button, .feed-actions a {
+#singleBtn, #netApply, #netTest, .feed-actions button, .feed-actions a {
   background: var(--panel2); color: var(--txt); border: 1px solid var(--line);
   border-radius: 8px; padding: 8px 12px; cursor: pointer; text-decoration: none; font-size: 12px;
 }
@@ -189,6 +190,17 @@ footer b { color: var(--txt); }
   border: 1px solid var(--amber); border-radius: 8px; padding: 8px 10px;
   background: rgba(20,14,2,.5); font-family: ui-monospace, Consolas, monospace;
 }
+
+/* ------------------------- exit IP / Tor rotation ------------------------ */
+#proxyList { margin-top: 10px; }
+#netStatus {
+  font-family: ui-monospace, Consolas, monospace; font-size: 11.5px;
+  padding: 3px 0;
+}
+#netStatus.tor { color: var(--purple); }
+#netStatus.warn { color: var(--amber); }
+#netStatus.ok { color: var(--green); }
+#netHint { margin-top: 8px; }
 .cam::before { /* hydra idle shimmer */
   content: ""; position: absolute; inset: -60%;
   background: conic-gradient(from 0deg, transparent 0 70deg, rgba(139,92,246,.06) 90deg, transparent 110deg 360deg);

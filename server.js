@@ -13,6 +13,10 @@
  *             cams (uses the Chrome/Edge already installed on the host, or
  *             playwright's chromium; if no real browser exists the run falls
  *             back to HYDRA — 6 real checkers inside the user's browser)
+ *
+ * Every engine can run through the rotating proxy layer (lib/proxy.js):
+ * Tor circuits (per-request SOCKS5 isolation +SIGNAL NEWNYM) or a round-robin
+ * proxy list. See GET/POST /api/net and POST /api/net/test.
  */
 
 const http = require('http');
@@ -20,6 +24,8 @@ const fs = require('fs');
 const path = require('path');
 const { liveCheck } = require('./lib/checkers');
 const { Swarm, bind, detectPlaywright, detectBrowser, swarm } = require('./lib/swarm');
+const proxyPool = require('./lib/proxy');
+const { exitCheck } = require('./lib/http');
 const {
   describeTarget, totalFor, nameAt, makeOrder, PATTERN_PRESETS, mulberry32,
 } = require('./lib/generator');
@@ -124,7 +130,7 @@ function ratePerMin(state) {
 
 function stateSnapshot(state) {
   if (!state) {
-    return { run: null, swarm: { available: !!detectPlaywright(), browser: detectBrowser(), error: null, mode: null, meta: null }, platforms: platformMeta(), presets: PATTERN_PRESETS };
+    return { run: null, swarm: { available: !!detectPlaywright(), browser: detectBrowser(), error: null, mode: null, meta: null }, platforms: platformMeta(), presets: PATTERN_PRESETS, proxy: proxyPool.status() };
   }
   const checked = state.checked;
   const rate = state.running ? ratePerMin(state) : 0;
@@ -164,6 +170,7 @@ function stateSnapshot(state) {
     },
     platforms: platformMeta(),
     presets: PATTERN_PRESETS,
+    proxy: proxyPool.status(),
   };
 }
 
@@ -313,7 +320,10 @@ const server = http.createServer(async (req, res) => {
         run.running = true;
         run.startedAt = Date.now();
       }
-      return json(res, 200, { ok: true, runId: run.id, total: run.total, orderSeed: run.order, swarmMode, note, browser: detectBrowser() });
+      return json(res, 200, {
+        ok: true, runId: run.id, total: run.total, orderSeed: run.order,
+        swarmMode, note, browser: detectBrowser(), proxy: proxyPool.describe(),
+      });
     }
 
     if (req.method === 'POST' && p === '/api/stop') {
@@ -403,6 +413,33 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === 'GET' && p === '/api/health') return json(res, 200, { ok: true, uptime: process.uptime() });
 
+    // --- rotating proxy layer (Tor circuits / proxy list) -------------------
+    if (req.method === 'GET' && p === '/api/net') {
+      return json(res, 200, { ok: true, proxy: proxyPool.status() });
+    }
+
+    if (req.method === 'POST' && p === '/api/net') {
+      const body = await readBody(req);
+      try {
+        const proxy = proxyPool.setConfig(body);
+        return json(res, 200, { ok: true, proxy });
+      } catch (e) {
+        return json(res, 400, { ok: false, error: String(e.message || e), proxy: proxyPool.status() });
+      }
+    }
+
+    if (req.method === 'POST' && p === '/api/net/test') {
+      // proves the current config end to end: one real request through the
+      // proxy to check.torproject.org, which answers with the exit IP
+      try {
+        const out = await exitCheck(20000);
+        return json(res, 200, { ok: !!out.ok, ...out, proxy: proxyPool.status() });
+      } catch (e) {
+        return json(res, 200, { ok: false, error: String(e.message || e).slice(0, 200), proxy: proxyPool.status() });
+      }
+    }
+
+
     if (req.method === 'GET') return serveStatic(req, res, p);
     json(res, 404, { ok: false, error: 'not found' });
   } catch (e) {
@@ -416,4 +453,6 @@ server.listen(PORT, HOST, () => {
   const browser = detectBrowser();
   console.log(`[SNIPR] engines: server | browser | swarm — real checks only (no demo)`);
   console.log(`[SNIPR] playwright: ${pw ? 'yes' : 'no'} · real browser: ${browser || 'none found (swarm falls back to 6 in-browser workers)'}`);
+  const proxy = proxyPool.initFromEnv();
+  console.log(`[SNIPR] proxy: ${proxy.label}`);
 });

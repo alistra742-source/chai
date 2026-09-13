@@ -24,6 +24,9 @@ node server.js          # zero dependencies for the server/browser engines, Node
 # open http://localhost:3000
 ```
 
+Want a rotating exit IP (Tor circuits or a proxy list)? See
+[Rotating exit IPs](#rotating-exit-ips--tor-circuits--proxy-list-zero-dependencies).
+
 ## Engines
 
 | Engine | What it does |
@@ -93,6 +96,64 @@ instead of dying (see below).
   blocker — [unfooled](https://github.com/unfooled/universal-username-checker) now requires an
   account token there; from datacenter IPs expect 401/429.)
 
+## Rotating exit IPs — Tor circuits / proxy list (zero dependencies)
+
+Section **4 · Exit IP** on the dashboard (or `POST /api/net`) puts the whole
+sweep behind a **rotating exit IP**. Three modes:
+
+| Mode | What actually happens |
+|---|---|
+| **off** | direct — the machine's own IP (default) |
+| **🧅 Tor** | every request goes through a Tor SOCKS5 port. Each request opens a **fresh circuit**: the app authenticates to Tor with a unique throwaway SOCKS5 username/password, and with Tor's `IsolateSOCKSAuth` (on by default for `SocksPort`) that means a **different exit node per request**. Every *N* requests it also sends **`SIGNAL NEWNYM`** on the control port for a hard new identity (throttled to Tor's own 10 s limit). |
+| **Proxy list** | one proxy per line (`socks5://…` or `http://…`, with optional `user:pass@`), used **round-robin — one per request**. |
+
+The layer is implemented in `lib/proxy.js`: a real SOCKS5 client (greeting,
+user/pass auth, CONNECT), HTTP proxies via `CONNECT`, per-request agents, and
+the Tor control protocol. `lib/http.js` is a small `fetch`-alike used by every
+checker, so **server, browser-relayed and swarm** checks all go through it.
+
+```bash
+# torrc (or /etc/tor/torrc)
+SocksPort 9050 IsolateSOCKSAuth   # fresh circuit per SOCKS5 credential pair
+ControlPort 9051                  # needed for SIGNAL NEWNYM rotation
+HashedControlPassword <hash>      # then set TOR_CONTROL_PASSWORD, or leave the control port closed
+```
+
+Environment defaults (the dashboard can change all of it at runtime):
+
+| Variable | Meaning |
+|---|---|
+| `SNIPR_PROXY` | `tor` \| `list` \| `off` (default `off`) |
+| `SNIPR_PROXY_LIST` | comma/newline separated proxy list (implies `list`) |
+| `TOR_SOCKS` | Tor SOCKS5 address, default `socks5://127.0.0.1:9050` |
+| `TOR_CONTROL` | Tor control address, default `127.0.0.1:9051` |
+| `TOR_CONTROL_PASSWORD` | password for the control port (omit to clear) |
+
+**Test exit IP** on the dashboard runs a real request through the current route
+to `check.torproject.org` and shows the exit IP plus whether it really is a Tor
+exit — so you can prove the tunnel works before a sweep. The run stats line
+keeps showing requests routed, new identities issued and exits seen.
+
+- **⚡ Swarm** passes the route to Playwright (`browser.newContext({ proxy })`),
+  one proxy per browser, so the six browsers don't share an exit IP.
+- The **swarm** picks up rotation between circuits; Chromium cannot send SOCKS5
+  credentials, so Tor circuit isolation applies to the server/browser-relayed
+  engines and the swarm follows `NEWNYM` instead.
+- The **browser/HYDRA** engine checks Discord from *your* browser, which no
+  server-side proxy can route — use **server** or **swarm** for full Tor
+  coverage.
+- Honest caveat: Tor exit nodes are widely blocked or rate-limited (Instagram,
+  TikTok and guns.lol's Cloudflare will often answer 403/429). Rotation helps
+  with per-IP limits, it does not make a blocked exit look residential — keep
+  the delay on, and prefer your own IP or a proxy list where Tor fails.
+
+Run the proxy test suite (mock SOCKS5 server, mock CONNECT proxy, mock Tor
+control port, real HTTPS through the tunnel):
+
+```bash
+npm test        # node test/net.test.js
+```
+
 ## Possibility math
 
 | Pattern | Charset | Count |
@@ -115,6 +176,9 @@ never repeats, never materialises the space in memory, so *left to check* stays 
 |---|---|
 | `GET /api/state` | live counters + swarm mode/worker telemetry + feed |
 | `GET /api/swarm` | real browser detected? playwright available? swarm running? per-browser stats |
+| `GET /api/net` | current rotating-exit config + live stats (requests routed, rotations, exits seen, errors) |
+| `POST /api/net` | `{mode: off\|tor\|list, torSocks, torControl, torPassword, isolate, rotateEvery, rotateIntervalMs, list}` |
+| `POST /api/net/test` | one real request through the current route → `{ip, isTor, ms}` (proves the tunnel) |
 | `GET /api/cam/1.jpg…6.jpg` | live screenshot of browser N (swarm mode) |
 | `POST /api/start` | `{platform, engine: server\|browser\|swarm, target, concurrency, delay, shuffle}` |
 | `POST /api/stop` | abort run + kill browsers |

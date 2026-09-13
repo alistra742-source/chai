@@ -38,6 +38,9 @@ const state = {
   swarmMode: null,        // 'playwright' | 'hydra' | null
   camAt: [0, 0, 0, 0, 0, 0],
   cams: {},               // workerId -> telemetry {current,checked,valid,last}
+  net: null,              // last proxy status from the server
+  netFilled: false,       // controls seeded from the server once
+  netToastUntil: 0,       // keep a test/apply result on screen briefly
 };
 
 /* ------------------------------ config UI ------------------------------- */
@@ -117,6 +120,113 @@ function currentTarget() {
   return { kind: 'list', names: listNames() };
 }
 
+/* ---------------------- exit IP / Tor rotation --------------------------- */
+const NET_NOTES = {
+  off: 'Direct — every check leaves from the IP of the machine running this app.',
+  tor: '🧅 Tor: checks are tunnelled through the Tor SOCKS5 port. Every request opens a fresh circuit (unique SOCKS5 credentials + Tor\'s IsolateSOCKSAuth), and every N requests a SIGNAL NEWNYM forces a brand-new exit node. Needs a local Tor with `SocksPort 9050 IsolateSOCKSAuth` and `ControlPort 9051`. Many platforms block Tor exits (expect errors on IG/TikTok) — a proxy list or your own IP works better there. Note: the browser/HYDRA engine checks Discord from YOUR browser, which no server-side proxy can route — use the server or swarm engine for full Tor coverage.',
+  list: 'Round-robin: each request uses the next proxy in the list (socks5:// or http://), so the exit IP changes request by request. Bad lines are rejected when you apply.',
+};
+function setNetStatus(text, cls) {
+  const el = $('#netStatus');
+  el.textContent = text;
+  el.className = 'muted small' + (cls ? ' ' + cls : '');
+}
+
+function syncNetUI() {
+  const mode = $('#proxyMode').value;
+  $$('label.tor-only').forEach(l => { l.hidden = mode !== 'tor'; });
+  const pwLabel = $('#torPasswordChk').closest('label');
+  const pwRow = $('#torPassword').closest('label');
+  if (pwRow) pwRow.hidden = !(mode === 'tor' && $('#torPasswordChk').checked);
+  if (pwLabel) pwLabel.hidden = mode !== 'tor';
+  $('#proxyList').hidden = mode !== 'list';
+  $('#netHint').textContent = NET_NOTES[mode] || '';
+}
+
+function netBody() {
+  const chk = $('#torPasswordChk').checked;
+  const pw = $('#torPassword').value;
+  const every = Number($('#rotEvery').value);
+  return {
+    mode: $('#proxyMode').value,
+    torSocks: $('#torSocks').value.trim(),
+    torControl: $('#torControl').value.trim(),
+    isolate: $('#torIsolate').checked,
+    rotateEvery: every,
+    rotateIntervalMs: Math.max(1000, (Number($('#rotInterval').value) || 10) * 1000),
+    list: $('#proxyList').value,
+    // never blank out a stored control password unless the box is unticked
+    ...(chk ? (pw ? { torPassword: pw } : {}) : { torPassword: '' }),
+  };
+}
+
+function netLabel(p) {
+  if (!p || p.mode === 'off') return 'direct — this machine\'s IP';
+  const s = p.stats || {};
+  const bits = [`${fmt(s.requests)} routed`];
+  if (s.rotations) bits.push(`${fmt(s.rotations)} × new identity`);
+  if (s.exitsSeen) bits.push(`${fmt(s.exitsSeen)} exit${s.exitsSeen === 1 ? '' : 's'} seen`);
+  if (s.lastExit && s.lastExit.ip) bits.push(`last exit ${s.lastExit.ip}${s.lastExit.isTor ? ' (Tor ✓)' : ''}`);
+  const err = s.errors && s.errors.length ? s.errors[s.errors.length - 1].msg : null;
+  return (p.mode === 'tor' ? '🧅 ' : '↻ ') + p.label + ' · ' + bits.join(' · ') + (err ? ' · ⚠ ' + err : '');
+}
+
+function renderNet(p) {
+  if (!p) return;
+  state.net = p;
+  if (Date.now() < state.netToastUntil) return;
+  setNetStatus(netLabel(p), p.mode === 'off' ? '' : 'tor');
+  if (state.netFilled) return;
+  state.netFilled = true;
+  $('#proxyMode').value = p.mode;
+  if (p.tor.socks) $('#torSocks').value = p.tor.socks;
+  if (p.tor.control) $('#torControl').value = p.tor.control;
+  $('#torIsolate').checked = p.tor.isolate !== false;
+  $('#torPasswordChk').checked = !!p.tor.hasPassword;
+  $('#rotEvery').value = String(p.rotateEvery);
+  $('#rotEveryVal').textContent = String(p.rotateEvery);
+  $('#rotInterval').value = String(Math.round(p.rotateIntervalMs / 1000));
+  if (p.list.length) $('#proxyList').value = p.list.map(x => x.label).join('\n');
+  syncNetUI();
+}
+
+async function loadNet() {
+  const j = await fetch('/api/net').then(r => r.json()).catch(() => null);
+  if (j && j.proxy) renderNet(j.proxy);
+}
+
+async function applyNet(silent) {
+  const j = await fetch('/api/net', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(netBody()),
+  }).then(r => r.json()).catch(() => null);
+  if (!j) { setNetStatus('⚠ server unreachable', 'warn'); return false; }
+  if (!j.ok) {
+    state.netToastUntil = Date.now() + 6000;
+    setNetStatus('⚠ ' + j.error, 'warn');
+    if (j.proxy) state.net = j.proxy;
+    return false;
+  }
+  if (!silent) state.netToastUntil = Date.now() + 4000;
+  setNetStatus(netLabel(j.proxy), j.proxy.mode === 'off' ? 'ok' : 'tor');
+  return true;
+}
+
+async function testNet() {
+  state.netToastUntil = Date.now() + 15000;
+  setNetStatus('testing the exit IP through the configured route…');
+  const j = await fetch('/api/net/test', { method: 'POST' }).then(r => r.json()).catch(() => null);
+  if (!j) return setNetStatus('⚠ server unreachable', 'warn');
+  if (!j.ok) return setNetStatus('⚠ ' + (j.error || 'exit test failed'), 'warn');
+  const verdict = j.isTor === true ? ' — Tor ✓' : j.isTor === false ? ' — NOT a Tor exit' : '';
+  setNetStatus(`exit IP ${j.ip}${verdict} · ${j.ms}ms · ${j.proxy}`, j.isTor ? 'ok' : 'warn');
+}
+
+$('#proxyMode').addEventListener('change', syncNetUI);
+$('#torPasswordChk').addEventListener('change', syncNetUI);
+$('#rotEvery').addEventListener('input', () => { $('#rotEveryVal').textContent = $('#rotEvery').value; });
+$('#netApply').addEventListener('click', () => applyNet(false));
+$('#netTest').addEventListener('click', testNet);
+
 function updateStartHint() {
   const t = currentTarget();
   const total = !t ? 0 : t.kind === 'pattern'
@@ -132,6 +242,7 @@ $('#startBtn').addEventListener('click', async () => {
   const t = currentTarget();
   if (!t) return;
   if (t.kind === 'list' && !t.names.length) return;
+  await applyNet(true);   // the run must use exactly what the panel shows
   const body = {
     platform: state.platform,
     engine: $('#engine').value,
@@ -439,7 +550,9 @@ function render(snap) {
     $('#feed').innerHTML = '<div class="muted empty">waiting for first results…</div>';
     for (let i = 1; i <= N_BROWSERS; i++) { state.cams[i] = { current: null, checked: 0, valid: 0, last: '—' }; renderCamPane(i); const img = $(`#camimg${i}`); if (img) { img.hidden = true; img.removeAttribute('src'); } }
   }
-  $('#runDesc').textContent = `${r.platform} · ${r.engine} engine · ${r.targetDesc}`;
+  if (snap.proxy) renderNet(snap.proxy);
+  const route = snap.proxy && snap.proxy.mode !== 'off' ? ` · ${snap.proxy.mode === 'tor' ? '🧅 tor' : '↻ ' + snap.proxy.list.length + ' proxies'}` : '';
+  $('#runDesc').textContent = `${r.platform} · ${r.engine} engine · ${r.targetDesc}${route}`;
   $('#stTotal').textContent = fmt(r.total);
   $('#stChecked').textContent = fmt(r.checked);
   $('#stValid').textContent = fmt(r.availableCount);
@@ -570,5 +683,7 @@ $('#copyHits').addEventListener('click', async () => {
   for (let i = 1; i <= N_BROWSERS; i++) state.cams[i] = { current: null, checked: 0, valid: 0, last: '—' };
   syncPatternUI();
   updateEngineNote();
+  syncNetUI();
+  loadNet();
   poll();
 })();

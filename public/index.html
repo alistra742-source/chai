@@ -95,6 +95,41 @@
     </div>
     <p class="muted small" id="engineNote"></p>
 
+    <h2>4 · Exit IP — rotating Tor / proxies</h2>
+    <div class="row">
+      <label>Route
+        <select id="proxyMode">
+          <option value="off">Direct — this machine's IP</option>
+          <option value="tor">🧅 Tor — rotating circuits</option>
+          <option value="list">Proxy list — round-robin</option>
+        </select>
+      </label>
+      <label class="chk tor-only"><input type="checkbox" id="torIsolate" checked> fresh circuit per request</label>
+      <label class="tor-only">SOCKS5 (Tor)
+        <input type="text" id="torSocks" value="socks5://127.0.0.1:9050" spellcheck="false">
+      </label>
+      <label class="tor-only">Control port
+        <input type="text" id="torControl" value="127.0.0.1:9051" spellcheck="false">
+      </label>
+      <label class="chk tor-only"><input type="checkbox" id="torPasswordChk"> control password</label>
+      <label class="tor-only" hidden>Tor password
+        <input type="password" id="torPassword" placeholder="HashedControlPassword" spellcheck="false">
+      </label>
+      <label class="tor-only">New identity every <b id="rotEveryVal">1</b> req
+        <input type="range" id="rotEvery" min="0" max="50" value="1">
+      </label>
+      <label class="tor-only">min gap (s)
+        <input type="text" inputmode="numeric" id="rotInterval" value="10">
+      </label>
+    </div>
+    <textarea id="proxyList" rows="3" spellcheck="false" hidden placeholder="one proxy per line:&#10;socks5://user:pass@127.0.0.1:1080&#10;http://user:pass@proxy.example:8080"></textarea>
+    <div class="row">
+      <button id="netApply">apply route</button>
+      <button id="netTest">test exit IP</button>
+      <span class="muted small" id="netStatus">direct — this machine's IP</span>
+    </div>
+    <p class="muted small" id="netHint"></p>
+
     <div class="row actions">
       <button id="startBtn" class="primary">▶ START SNIPING</button>
       <button id="stopBtn" class="danger" disabled>■ STOP</button>
@@ -152,7 +187,7 @@
 </section>
 
 <footer>
-  <span>checkers ported from open-source GitHub tools: <b>xnxv/guns.lol.scanner</b> · <b>M58-ENSIBS/guns.lol-fetcher</b> · <b>daskeptaxd/username-checker</b> · <b>swagkarna/TikTok-Username-Checker</b> · <b>efekrbas/guns.lol-username-checker</b> (2026, browser detection + premium filter) · <b>CuteTenshii/guns-solver</b> (2026, cf_clearance intel) — see README</span>
+  <span>tor rotation: per-request SOCKS5 circuit isolation + <b>SIGNAL NEWNYM</b> · checkers ported from open-source GitHub tools: <b>xnxv/guns.lol.scanner</b> · <b>M58-ENSIBS/guns.lol-fetcher</b> · <b>daskeptaxd/username-checker</b> · <b>swagkarna/TikTok-Username-Checker</b> · <b>efekrbas/guns.lol-username-checker</b> (2026, browser detection + premium filter) · <b>CuteTenshii/guns-solver</b> (2026, cf_clearance intel) — see README</span>
   <span class="muted">educational tool — respect each platform's ToS, keep delays on, don't hammer</span>
 </footer>
 

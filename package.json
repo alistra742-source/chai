@@ -5,7 +5,8 @@
   "description": "Multi-platform username sniper (guns.lol / Discord / Instagram / TikTok) with 6-browser swarm + live cam wall",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node test/net.test.js"
   },
   "engines": {
     "node": ">=18"
