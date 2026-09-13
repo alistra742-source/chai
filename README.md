@@ -133,6 +133,24 @@ checker, so **server, browser-relayed and swarm** checks all go through it.
   target, every worker pauses (2 s, doubling to 30 s, decaying again on healthy
   answers) and the dashboard shows `⏸ … is throttling this IP` instead of a wall
   of identical error rows.
+- **A route that cannot be dialled is refused, not blamed on the site.** This is
+  what a wall of `exception — network error reaching …` rows usually means: Tor
+  is not running, a proxy host/port is wrong, or the proxy is dead — so every
+  request dies before it reaches the platform. Tunnels dialled by our side are
+  tagged, the checker reports `can't reach the proxy route (…)` with the OS
+  error (`ECONNREFUSED 127.0.0.1:9050`), and:
+
+  - `POST /api/net` returns `route: {ok:false, error}` immediately after you
+    **apply route**, so the dashboard says `⚠ saved, but the route does not
+    answer: …`;
+  - `POST /api/start` **refuses to start** a run on an undiallable route;
+  - if the route dies mid-run, the engine stops after 3 straight proxy failures
+    instead of marking the whole wordlist as errors.
+
+  `POST /api/net/check` probes the current route on demand. The probe does a TCP
+  connect to the proxy (plus the SOCKS5 greeting) and also warns when a Tor
+  control port is unreachable — that alone does not stop rotation, it only
+  disables `SIGNAL NEWNYM`.
 
 ```bash
 # torrc (or /etc/tor/torrc)
@@ -170,6 +188,12 @@ keeps showing requests routed, new identities issued and exits seen.
   and prefer your own IP or a proxy list where Tor fails. Better still: leave
   the route **off** for guns.lol on a normal connection now that the clearance
   cookie is replayed — the 429s there were self-inflicted, not Cloudflare.
+- **Tor mode needs a Tor daemon on the same machine as this app.** The Freebuff
+  sandbox (and most hosting containers) has no `tor` binary and nothing on port
+  9050, so selecting 🧅 Tor there fails every request — which is exactly the
+  `network error` wall the route check now reports up front. Use a **proxy
+  list** (`socks5://…` / `http://…`, e.g. a residential proxy provider) or leave
+  the route **off** in the sandbox, and run Tor locally if you want circuits.
 
 Run the proxy test suite (mock SOCKS5 server, mock CONNECT proxy, mock Tor
 control port, real HTTPS through the tunnel):
@@ -202,6 +226,7 @@ never repeats, never materialises the space in memory, so *left to check* stays 
 | `GET /api/swarm` | real browser detected? playwright available? swarm running? per-browser stats |
 | `GET /api/net` | current rotating-exit config + live stats (requests routed, rotations, exits seen, errors) |
 | `POST /api/net` | `{mode: off\|tor\|list, torSocks, torControl, torPassword, isolate, rotateEvery, rotateIntervalMs, list}` |
+| `POST /api/net/check` | probe the configured route → `{ok, error, results[]}` (TCP/SOCKS5 reachability, no traffic to the target) |
 | `POST /api/net/test` | one real request through the current route → `{ip, isTor, ms}` (proves the tunnel) |
 | `GET /api/cam/1.jpg…6.jpg` | live screenshot of browser N (swarm mode) |
 | `POST /api/start` | `{platform, engine: server\|browser\|swarm, target, concurrency, delay, shuffle}` |

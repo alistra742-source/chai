@@ -206,6 +206,18 @@ async function applyNet(silent) {
     if (j.proxy) state.net = j.proxy;
     return false;
   }
+  // a route that saves but cannot be dialled is the #1 cause of "every name is
+  // a network error", so say it right here instead of letting a run discover it
+  if (j.route && !j.route.ok) {
+    state.netToastUntil = Date.now() + 8000;
+    setNetStatus('⚠ saved, but the route does not answer: ' + j.route.error, 'warn');
+    return true;
+  }
+  if (j.route && j.route.warnings && j.route.warnings.length) {
+    state.netToastUntil = Date.now() + 8000;
+    setNetStatus('⚠ ' + j.route.warnings[0], 'warn');
+    return true;
+  }
   if (!silent) state.netToastUntil = Date.now() + 4000;
   setNetStatus(netLabel(j.proxy), j.proxy.mode === 'off' ? 'ok' : 'tor');
   return true;

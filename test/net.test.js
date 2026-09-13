@@ -21,6 +21,7 @@ const assert = require('assert');
 
 const pool = require('../lib/proxy');
 const { fetchWithTimeout, exitCheck } = require('../lib/http');
+const { liveCheck } = require('../lib/checkers');
 
 let passed = 0;
 const failures = [];
@@ -419,6 +420,53 @@ async function startOrigin() {
     if (!out.ip) return console.log('      (skipped: no external network)');
     assert.ok(pool.status().stats.lastExit.ip, 'exit IP was not recorded');
     assert.ok(pool.status().stats.exitsSeen >= 1);
+  });
+
+  await test('a bare 127.0.0.1:9050 Tor address is read as SOCKS5', () => {
+    const st = pool.setConfig({ mode: 'tor', torSocks: '127.0.0.1:9050' });
+    assert.strictEqual(st.tor.socks, 'socks5://127.0.0.1:9050');
+    assert.throws(() => pool.setConfig({ mode: 'tor', torSocks: 'http://1.2.3.4:8080' }), /socks5/);
+  });
+
+  await test('checkRoute() proves a live proxy answers and names a dead one', async () => {
+    pool.setConfig({ mode: 'tor', torSocks: `socks5://127.0.0.1:${socks.port}`, torControl: '' });
+    const good = await pool.checkRoute(4000);
+    assert.strictEqual(good.ok, true, good.error);
+    assert.strictEqual(good.results[0].ok, true, 'the live SOCKS5 mock was not accepted');
+
+    // an HTTP CONNECT proxy answers as soon as the TCP connect succeeds
+    pool.setConfig({ mode: 'list', list: [`http://127.0.0.1:${httpProxy.port}`] });
+    assert.strictEqual((await pool.checkRoute(4000)).ok, true);
+
+    // a port that is not a SOCKS5 proxy is not a usable Tor route either
+    pool.setConfig({ mode: 'list', list: [`socks5://127.0.0.1:${httpProxy.port}`] });
+    const notSocks = await pool.checkRoute(4000);
+    assert.strictEqual(notSocks.ok, false);
+    assert.match(notSocks.error, /not a SOCKS5 proxy/);
+
+    pool.setConfig({ mode: 'list', list: ['socks5://127.0.0.1:1'] });
+    const dead = await pool.checkRoute(1500);
+    assert.strictEqual(dead.ok, false);
+    assert.match(dead.error, /ECONNREFUSED|refused|no answer/);
+
+    pool.setConfig({ mode: 'off' });
+    assert.strictEqual((await pool.checkRoute()).ok, true, 'direct mode is always ok');
+  });
+
+  await test('a dead route is reported as kind "proxy", never blamed on the site', async () => {
+    pool.setConfig({ mode: 'tor', torSocks: 'socks5://127.0.0.1:1', torControl: '' });
+    try {
+      await fetchWithTimeout('https://example.com/', {}, 3000);
+      assert.fail('a request through a dead route should throw');
+    } catch (e) {
+      assert.ok(pool.isProxyError(e), `error was not tagged as a proxy failure: ${e.message}`);
+    }
+    await assert.rejects(() => liveCheck('gunslol', 'sometestname'), (e) => {
+      assert.strictEqual(e.kind, 'proxy');
+      assert.match(e.message, /proxy route/i);
+      return true;
+    });
+    pool.setConfig({ mode: 'off' });
   });
 
   made.push(origin, socks, socksAuth, httpProxy, httpProxy2, control, controlPw);

@@ -166,7 +166,7 @@ function stateSnapshot(state) {
       elapsedSec: state.startedAt ? Math.round(((state.finishedAt || Date.now()) - state.startedAt) / 1000) : 0,
       feed: state.feed.slice(-120),
       available: state.available.slice(-2000),
-      lastErrors: state.lastErrors.slice(10),
+      lastErrors: state.lastErrors.slice(-10),
       concurrency: state.concurrency,
       delay: state.delay,
       throttle: {
@@ -197,6 +197,11 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const THROTTLE_BASE_MS = 2000;
 const THROTTLE_MAX_MS = 30000;
 
+/* A route that fails to dial is not a target responding badly: every name would
+ * be marked as an error and the site would get the blame. Give up on the run
+ * and say so instead. */
+const PROXY_FAILS_BEFORE_ABORT = 3;
+
 function throttle(state) {
   state.throttleHits = Math.min(6, (state.throttleHits || 0) + 1);
   const wait = Math.min(THROTTLE_MAX_MS, THROTTLE_BASE_MS * Math.pow(2, state.throttleHits - 1));
@@ -208,6 +213,7 @@ async function runServerEngine(state) {
   state.running = true;
   state.startedAt = Date.now();
   const cursor = { i: 0 };
+  let proxyFails = 0;
   const nworkers = Math.max(1, Math.min(MAX_CONCURRENCY, state.concurrency || 5));
 
   const pauseWhileCooling = async () => {
@@ -233,8 +239,16 @@ async function runServerEngine(state) {
       } catch (e) {
         res = { status: 'error', http: 0, via: 'exception', kind: e.kind, note: String(e.message || e).slice(0, 140) };
       }
-      if (res.status !== 'error') state.throttleHits = Math.max(0, state.throttleHits - 1);
-      else if (res.kind === 'ratelimited' || res.kind === 'blocked') throttle(state);
+      if (res.kind === 'proxy') {
+        proxyFails++;
+        if (proxyFails >= PROXY_FAILS_BEFORE_ABORT && !state.abort) {
+          state.error = `proxy route unreachable — stopped after ${proxyFails} straight failures: ${res.note}`;
+          state.abort = true;
+        }
+      } else if (res.status !== 'error') {
+        proxyFails = 0;
+        state.throttleHits = Math.max(0, state.throttleHits - 1);
+      } else if (res.kind === 'ratelimited' || res.kind === 'blocked') throttle(state);
       record(state, name, res);
       if (state.delay > 0) {
         const jitter = state.delay * (0.7 + Math.random() * 0.6);
@@ -317,6 +331,17 @@ const server = http.createServer(async (req, res) => {
         target = { kind: 'single', name };
       } else {
         return json(res, 400, { ok: false, error: 'missing target' });
+      }
+
+      // Refuse to start on a route that cannot be dialled at all — otherwise
+      // every name comes back "network error" and the platform gets the blame.
+      const route = await proxyPool.checkRoute();
+      if (!route.ok) {
+        return json(res, 400, {
+          ok: false,
+          error: `proxy route unreachable (${route.error}) — fix section 4 (is Tor running? is the proxy alive?) or set the route to direct`,
+          route, proxy: proxyPool.status(),
+        });
       }
 
       run = newRun({
@@ -453,11 +478,17 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, proxy: proxyPool.status() });
     }
 
+    if (req.method === 'POST' && p === '/api/net/check') {
+      const route = await proxyPool.checkRoute();
+      return json(res, 200, { ok: route.ok, route, proxy: proxyPool.status() });
+    }
+
     if (req.method === 'POST' && p === '/api/net') {
       const body = await readBody(req);
       try {
         const proxy = proxyPool.setConfig(body);
-        return json(res, 200, { ok: true, proxy });
+        const route = await proxyPool.checkRoute();   // prove the new route dials
+        return json(res, 200, { ok: true, proxy, route });
       } catch (e) {
         return json(res, 400, { ok: false, error: String(e.message || e), proxy: proxyPool.status() });
       }
