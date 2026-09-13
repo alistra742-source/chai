@@ -1,11 +1,14 @@
 'use strict';
 /* SNIPR frontend — dashboard, live cam wall, HYDRA swarm runtime.
  *
- * HYDRA: when the "swarm" engine is picked and the server has no Playwright,
- * the run falls back to 6 parallel Web Workers inside THIS browser (your real
- * browser, your real IP). Discord is checked directly (Pomelo endpoint allows
- * CORS); other platforms are relayed through /api/proxy. Workers auto-degrade
- * to deterministic simulation if the host has no outbound access.
+ * There is no simulation anywhere: every result comes from a real request.
+ *
+ * HYDRA: when the "swarm" engine is picked but the host has no real browser
+ * to drive, the run falls back to 6 parallel Web Workers inside THIS browser
+ * (your real browser, your real IP). Discord is checked directly (Pomelo
+ * endpoint allows CORS); other platforms are relayed through /api/proxy.
+ * The server hands out every name exactly once, so the six workers never
+ * duplicate work.
  */
 
 const $ = (s) => document.querySelector(s);
@@ -30,9 +33,11 @@ const state = {
   browserAbort: false,
   pumping: false,
   hydraRunning: false,
+  hydraWorkers: [],
+  lastCfg: null,          // config of the run in flight (hydra fallback)
   swarmMode: null,        // 'playwright' | 'hydra' | null
   camAt: [0, 0, 0, 0, 0, 0],
-  cams: {},               // workerId -> telemetry {current,checked,valid,last,sim}
+  cams: {},               // workerId -> telemetry {current,checked,valid,last}
 };
 
 /* ------------------------------ config UI ------------------------------- */
@@ -97,10 +102,9 @@ function listNames() {
 }
 
 const ENGINE_NOTES = {
-  demo: 'Demo simulates results deterministically (no network) — try the math and the cam wall safely.',
   server: 'Real checkers (ported from GitHub tools) fired from the machine hosting this app. Needs open outbound internet from that host.',
   browser: 'Checks run from YOUR browser: Discord directly (CORS-enabled Pomelo endpoint); guns.lol / IG / TikTok relayed via /api/proxy on the server.',
-  swarm: '⚡ 6 REAL headless Chrome browsers sniping at the same time on the host, each with a live screenshot cam (needs `npm i playwright && npx playwright install chromium` on the host). If Playwright is missing, it auto-falls back to HYDRA: 6 worker-threads inside YOUR browser — cam panes then show live per-browser telemetry.',
+  swarm: '⚡ 6 REAL browsers sniping at the same time on the host, each with a live screenshot cam. Uses the Google Chrome / Edge already installed (or playwright\'s chromium via `npm i playwright`). If the host has no real browser, the run falls back to HYDRA: 6 real checkers inside YOUR browser.',
 };
 function updateEngineNote() { $('#engineNote').textContent = ENGINE_NOTES[$('#engine').value] || ''; }
 $('#engine').addEventListener('change', updateEngineNote);
@@ -140,25 +144,28 @@ $('#startBtn').addEventListener('click', async () => {
     .then(x => x.json()).catch(() => ({ ok: false, error: 'server unreachable' }));
   if (!r.ok) { $('#startHint').textContent = '⚠ ' + r.error; return; }
   state.browserAbort = false;
+  state.lastCfg = body;
+  $('#runError').hidden = true;
   $('#stopBtn').disabled = false;
   $('#startBtn').disabled = true;
 
   if (body.engine === 'swarm') {
     state.swarmMode = r.swarmMode || 'hydra';
     $('#camMode').textContent = state.swarmMode === 'playwright'
-      ? '· 6× headless Chrome on host — LIVE VIDEO'
-      : '· HYDRA — 6 workers in your browser';
-    if (state.swarmMode === 'hydra') startHydra(body, r.total);
+      ? `· 6× ${r.browser || 'real browser'} on host — LIVE VIDEO`
+      : '· HYDRA — 6 real checkers in your browser';
+    $('#startHint').textContent = r.note || '';
+    if (state.swarmMode === 'hydra') startHydra(body);
   } else {
     state.swarmMode = null;
-    if (body.engine === 'browser') pumpBrowser(body, r.total);
+    if (body.engine === 'browser') pumpBrowser(body);
   }
   pollSoon();
 });
 
 $('#stopBtn').addEventListener('click', async () => {
   state.browserAbort = true;
-  state.hydraRunning = false;
+  stopHydra();
   await fetch('/api/stop', { method: 'POST' });
   $('#stopBtn').disabled = true;
   $('#startBtn').disabled = false;
@@ -181,20 +188,22 @@ async function checkDiscordDirect(name) {
   }
 }
 
-async function pumpBrowser(cfg, total) {
+async function pumpBrowser(cfg) {
   if (state.pumping) return;
   state.pumping = true;
   const chunk = 25;
-  const conc = Math.max(1, Number(cfg.concurrency) || 5);
-  let cursor = 0;
+  const conc = Math.max(1, Math.min(6, Number(cfg.concurrency) || 5));
+  let done = false;   // the server cursor is exhausted — every worker can stop
   const worker = async () => {
-    while (!state.browserAbort && cursor < total) {
-      const start = cursor; cursor += chunk;
-      const { names } = await fetch(`/api/targets?start=${start}&n=${chunk}`).then(r => r.json()).catch(() => ({ names: [] }));
-      if (!names || !names.length) { if (cursor >= total) return; continue; }
-      let results;
+    while (!state.browserAbort && !done) {
+      let names = [], last = false;
+      try {
+        const j = await fetch(`/api/targets?n=${chunk}`).then(r => r.json());
+        names = j.names || []; last = !!j.done;
+      } catch (_) { break; }
+      if (!names.length) { done = true; break; }
+      let results = [];
       if (cfg.platform === 'discord') {
-        results = [];
         for (const n of names) {
           if (state.browserAbort) break;
           results.push(await checkDiscordDirect(n));
@@ -205,103 +214,101 @@ async function pumpBrowser(cfg, total) {
           method: 'POST', headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ platform: cfg.platform, names }),
         }).then(x => x.json()).catch(() => ({ results: names.map(n => ({ name: n, status: 'error', note: 'proxy failed' })) }));
-        results = r.results;
+        results = r.results || [];
+        if (cfg.delay > 0) await new Promise(res => setTimeout(res, cfg.delay));
       }
       await fetch('/api/report', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ results }) }).catch(() => {});
+      if (last) { done = true; break; }
     }
   };
-  await Promise.all(Array.from({ length: Math.min(conc, 6) }, worker));
+  await Promise.all(Array.from({ length: conc }, worker));
   state.pumping = false;
   $('#stopBtn').disabled = true;
   $('#startBtn').disabled = false;
 }
 
 /* ------------------------------ HYDRA swarm ------------------------------ */
-/* 6 Web Workers in this tab = 6 parallel checkers with live telemetry. */
+/* 6 Web Workers in this tab = 6 parallel REAL checkers with live telemetry.
+ * Each worker pulls its next chunk from the server cursor, so the six of them
+ * split the space instead of re-checking each other's names. */
 const HYDRA_SRC = `
-let sim = false, errStreak = 0, checked = 0, valid = 0, current = null, last = '—';
-function fnv1a(str){let h=0x811c9dc5;for(let i=0;i<str.length;i++){h^=str.charCodeAt(i);h=Math.imul(h,0x01000193);}return h>>>0;}
-function demoCheck(platform,name,cs,len){
-  const h=fnv1a(platform+'::'+name);
-  let pct={gunslol:5.5,discord:4.0,instagram:1.6,tiktok:2.8}[platform]||5;
-  pct*=(len===3?0.55:len===4?1:1.4); pct*=(cs==='C'?1.2:1);
-  if(h%997===0) return {name,status:'error',note:'simulated network error',via:'sim'};
-  if((h%1000)/10<pct) return {name,status:'available',via:'sim'};
-  return {name,status:'taken',via:'sim'};
-}
-async function jfetch(u,o){const r=await fetch(u,o);return r;}
-self.onmessage = async (e) => {
-  const {cmd} = e.data;
-  if (cmd !== 'run') return;
-  const {origin, platform, mode, delay, workerId, total, chunkSize, remainder, cs, len} = e.data;
-  sim = (mode === 'sim');
-  let cursor = remainder * chunkSize;   // disjoint chunk streams per worker
-  while (cursor < total) {
-    let names = [];
+let checked = 0, valid = 0, current = null, last = '—', stopped = false;
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+async function checkOne(origin, platform, name) {
+  if (platform === 'discord') {
     try {
-      const r = await jfetch(origin + '/api/targets?start=' + cursor + '&n=' + chunkSize);
-      names = (await r.json()).names || [];
-    } catch (_) {}
+      const r = await fetch('https://discord.com/api/v9/unique-username/username-attempt-unauthed', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ username: name }),
+      });
+      if (r.status === 429) return { name, status: 'error', note: 'rate limited' };
+      if (r.status === 400) return { name, status: 'invalid', via: 'pomelo-hydra' };
+      if (!r.ok) return { name, status: 'error', note: 'http ' + r.status };
+      const j = await r.json();
+      return { name, status: j.taken ? 'taken' : 'available', via: 'pomelo-hydra' };
+    } catch (_) { return { name, status: 'error', note: 'blocked by browser (CORS/network)' }; }
+  }
+  try {
+    const j = await fetch(origin + '/api/proxy', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ platform, names: [name] }),
+    }).then(r => r.json());
+    return (j.results && j.results[0]) || { name, status: 'error', note: 'proxy returned nothing' };
+  } catch (_) { return { name, status: 'error', note: 'proxy unreachable' }; }
+}
+
+self.onmessage = async (e) => {
+  const d = e.data || {};
+  if (d.cmd === 'stop') { stopped = true; return; }
+  if (d.cmd !== 'run') return;
+  const { origin, platform, delay, workerId, chunkSize } = d;
+  while (!stopped) {
+    let names = [], done = false;
+    try {
+      const j = await fetch(origin + '/api/targets?n=' + chunkSize).then(r => r.json());
+      names = j.names || []; done = !!j.done;
+    } catch (_) { break; }
     if (!names.length) break;
-    let results = [];
-    if (sim) {
-      results = names.map(n => demoCheck(platform, n, cs, len));
-      if (delay > 0) await new Promise(r2 => setTimeout(r2, delay));
-    } else if (platform === 'discord') {
-      results = [];
-      for (const name of names) {
-        current = name;
-        try {
-          const r = await jfetch('https://discord.com/api/v9/unique-username/username-attempt-unauthed', {
-            method: 'POST', headers: {'content-type':'application/json'},
-            body: JSON.stringify({username: name}),
-          });
-          if (r.status === 400) results.push({name, status:'invalid', via:'pomelo-hydra'});
-          else if (!r.ok) results.push({name, status:'error', note:'http '+r.status});
-          else { const jj = await r.json(); results.push({name, status: jj.taken ? 'taken':'available', via:'pomelo-hydra'}); }
-        } catch (_) { results.push({name, status:'error', note:'blocked'}); }
-        if (delay > 0) await new Promise(r2 => setTimeout(r2, delay));
-      }
-    } else {
-      try {
-        const r = await jfetch(origin + '/api/proxy', {
-          method:'POST', headers:{'content-type':'application/json'},
-          body: JSON.stringify({platform, names}),
-        });
-        results = (await r.json()).results || [];
-      } catch (_) { results = names.map(n => ({name:n, status:'error', note:'proxy failed'})); }
-    }
-    // auto-degrade: host has no egress -> switch this worker to simulation
-    if (!sim) {
-      const errs = results.filter(x => x.status === 'error').length;
-      errStreak = errs === results.length ? errStreak + errs : 0;
-      if (errStreak >= 8) { sim = true; errStreak = 0; }
+    const results = [];
+    for (const name of names) {
+      if (stopped) break;
+      current = name;
+      results.push(await checkOne(origin, platform, name));
+      if (delay > 0) await sleep(delay * (0.7 + Math.random() * 0.6));
     }
     checked += results.length;
     valid += results.filter(x => x.status === 'available').length;
-    last = results.length ? results[results.length-1].status : '—';
-    current = names[names.length-1];
-    postMessage({type:'batch', workerId, results, tele:{current, checked, valid, last, sim}});
-    cursor += chunkSize;
+    last = results.length ? results[results.length - 1].status : '—';
+    try {
+      await fetch(origin + '/api/report', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ results }),
+      });
+    } catch (_) {}
+    postMessage({ type: 'batch', workerId, results, tele: { current, checked, valid, last } });
+    if (done) break;
   }
-  postMessage({type:'done', workerId, tele:{current:null, checked, valid, last:'exited', sim}});
+  postMessage({ type: 'done', workerId, tele: { current: null, checked, valid, last: 'exited' } });
 };
 `;
 
-function startHydra(cfg, total) {
+let HYDRA_URL = null;
+
+function startHydra(cfg) {
   if (state.hydraRunning) return;
   state.hydraRunning = true;
-  const blob = new Blob([HYDRA_SRC], { type: 'application/javascript' });
-  const url = URL.createObjectURL(blob);
+  state.lastCfg = cfg;
+  HYDRA_URL = URL.createObjectURL(new Blob([HYDRA_SRC], { type: 'application/javascript' }));
   const chunkSize = 6;
-  const cs = cfg.target.kind === 'pattern' ? cfg.target.charset : 'C';
-  const len = cfg.target.kind === 'pattern' ? cfg.target.len : 4;
-  const mode = cfg.engine === 'demo' ? 'sim' : 'live';
   let active = N_BROWSERS;
 
   for (let w = 1; w <= N_BROWSERS; w++) {
-    const worker = new Worker(url);
-    state.cams[w] = { current: null, checked: 0, valid: 0, last: 'booting…', sim: false };
+    let worker;
+    try { worker = new Worker(HYDRA_URL); } catch (_) { active--; continue; }
+    state.hydraWorkers.push(worker);
+    state.cams[w] = { current: null, checked: 0, valid: 0, last: 'booting…' };
+    renderCamPane(w);
     worker.onmessage = (e) => {
       const d = e.data;
       if (d.type === 'batch') {
@@ -314,20 +321,37 @@ function startHydra(cfg, total) {
       } else if (d.type === 'done') {
         state.cams[d.workerId] = { ...state.cams[d.workerId], ...d.tele };
         renderCamPane(d.workerId);
-        if (--active <= 0) {
-          state.hydraRunning = false;
-          URL.revokeObjectURL(url);
-          $('#stopBtn').disabled = true;
-          $('#startBtn').disabled = false;
-        }
+        if (--active <= 0) endHydra();
       }
     };
+    worker.onerror = () => {
+      state.cams[w] = { ...state.cams[w], current: null, last: 'worker error' };
+      renderCamPane(w);
+      if (--active <= 0) endHydra();
+    };
     worker.postMessage({
-      cmd: 'run', origin: location.origin, platform: cfg.platform, mode,
-      delay: cfg.delay, workerId: w, total, chunkSize,
-      remainder: (w - 1) % N_BROWSERS, cs, len,
+      cmd: 'run', origin: location.origin, platform: cfg.platform,
+      delay: cfg.delay, workerId: w, chunkSize,
     });
   }
+  if (active <= 0) endHydra();
+}
+
+function endHydra() {
+  state.hydraRunning = false;
+  state.hydraWorkers = [];
+  if (HYDRA_URL) { URL.revokeObjectURL(HYDRA_URL); HYDRA_URL = null; }
+  $('#stopBtn').disabled = true;
+  $('#startBtn').disabled = false;
+}
+
+function stopHydra() {
+  for (const w of state.hydraWorkers) {
+    try { w.postMessage({ cmd: 'stop' }); w.terminate(); } catch (_) {}
+  }
+  state.hydraWorkers = [];
+  if (state.hydraRunning) endHydra();
+  else if (HYDRA_URL) { URL.revokeObjectURL(HYDRA_URL); HYDRA_URL = null; }
 }
 
 /* ------------------------------ LIVE CAM wall ---------------------------- */
@@ -343,8 +367,7 @@ function buildCams() {
       <img id="camimg${i}" alt="browser ${i} live feed" hidden>
       <div class="cam-name" id="camname${i}">—</div>
       <div class="cam-meta" id="cammeta${i}">checked 0 · valid 0</div>
-      <div class="cam-feed" id="camfeed${i}"></div>
-      <div class="cam-sim" id="camsim${i}" hidden>SIM — no egress, demo math</div>`;
+      <div class="cam-feed" id="camfeed${i}"></div>`;
     wrap.appendChild(pane);
   }
 }
@@ -355,8 +378,7 @@ function renderCamPane(i) {
   const set = (id, v) => { const el = $(id); if (el && el.textContent !== v) el.textContent = v; };
   set(`#camname${i}`, t.current || '—');
   set(`#cammeta${i}`, `checked ${fmt(t.checked)} · valid ${fmt(t.valid)} · last ${t.last}`);
-  set(`#camstat${i}`, t.current ? (t.sim ? 'sniping (sim)' : 'sniping…') : (t.last === 'exited' ? 'done' : 'idle'));
-  const simEl = $(`#camsim${i}`); if (simEl) simEl.hidden = !t.sim;
+  set(`#camstat${i}`, t.current ? 'sniping…' : (t.last === 'exited' ? 'done' : 'idle'));
   const pane = $(`#cam${i}`);
   if (pane) pane.classList.toggle('live', !!t.current);
 }
@@ -365,8 +387,7 @@ function renderServerCams(meta) {
   if (!meta || !meta.workers) return;
   for (const w of meta.workers) {
     state.cams[w.id] = {
-      current: w.current, checked: w.checked, valid: w.valid,
-      last: w.last, sim: false,
+      current: w.current, checked: w.checked, valid: w.valid, last: w.last,
     };
     renderCamPane(w.id);
     const img = $(`#camimg${w.id}`);
@@ -386,7 +407,7 @@ $('#singleBtn').addEventListener('click', async () => {
   $('#singleOut').textContent = '…checking';
   const r = await fetch('/api/check', {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ platform: state.platform, engine: $('#engine').value === 'swarm' ? 'server' : $('#engine').value, name }),
+    body: JSON.stringify({ platform: state.platform, name }),
   }).then(x => x.json()).catch(() => ({ status: 'error', note: 'server unreachable' }));
   $('#singleOut').className = 'pill ' + r.status;
   $('#singleOut').textContent = `${name}: ${r.status}${r.note ? ' — ' + r.note : ''}`;
@@ -416,7 +437,7 @@ function render(snap) {
     state.feedRenderedKey = '';
     state.cams = {};
     $('#feed').innerHTML = '<div class="muted empty">waiting for first results…</div>';
-    for (let i = 1; i <= N_BROWSERS; i++) { state.cams[i] = { current: null, checked: 0, valid: 0, last: '—', sim: false }; renderCamPane(i); const img = $(`#camimg${i}`); if (img) { img.hidden = true; img.removeAttribute('src'); } }
+    for (let i = 1; i <= N_BROWSERS; i++) { state.cams[i] = { current: null, checked: 0, valid: 0, last: '—' }; renderCamPane(i); const img = $(`#camimg${i}`); if (img) { img.hidden = true; img.removeAttribute('src'); } }
   }
   $('#runDesc').textContent = `${r.platform} · ${r.engine} engine · ${r.targetDesc}`;
   $('#stTotal').textContent = fmt(r.total);
@@ -443,12 +464,26 @@ function render(snap) {
     $('#startBtn').disabled = true;
   }
 
+  // surface why a run died instead of silently flipping back to idle
+  const err = r.error || (snap.swarm && snap.swarm.error) || null;
+  const errEl = $('#runError');
+  if (err) { errEl.hidden = false; errEl.textContent = '⚠ ' + err; } else { errEl.hidden = true; }
+
   // cam wall source of truth
   if (snap.swarm && snap.swarm.meta) {
-    if ($('#camMode').textContent.indexOf('LIVE VIDEO') === -1) $('#camMode').textContent = '· 6× headless Chrome on host — LIVE VIDEO';
+    const label = '· 6× ' + (snap.swarm.meta.browser || 'real browser') + ' on host — LIVE VIDEO';
+    if ($('#camMode').textContent !== label) $('#camMode').textContent = label;
     renderServerCams(snap.swarm.meta);
   } else if (state.hydraRunning || Object.values(state.cams).some(c => c.checked)) {
-    if ($('#camMode').textContent === '· idle') $('#camMode').textContent = '· HYDRA — 6 workers in your browser';
+    const label = '· HYDRA — 6 real checkers in your browser';
+    if ($('#camMode').textContent !== label) $('#camMode').textContent = label;
+  }
+
+  // the swarm engine without a real browser on the host (or a host swarm that
+  // died on launch) keeps running as 6 real in-browser workers
+  if (r.running && r.engine === 'swarm' && snap.swarm && snap.swarm.mode === 'hydra'
+      && !state.hydraRunning && !state.browserAbort && state.lastCfg) {
+    startHydra(state.lastCfg);
   }
 
   renderFeed(r);
@@ -510,7 +545,7 @@ $('#copyHits').addEventListener('click', async () => {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ platform: 'discord', engine: 'server', name: 'zzqx9v' }),
     }).then(x => x.json());
-    if (r.status === 'error') set('● host: outbound blocked → Demo / HYDRA in your browser', 'var(--amber)');
+    if (r.status === 'error') set('● host: outbound blocked → run from your browser (HYDRA)', 'var(--amber)');
     else set('● host: outbound OK (probe: discord ' + r.status + ')', 'var(--green)');
   } catch (_) {
     set('● server unreachable', 'var(--red)');
@@ -518,8 +553,9 @@ $('#copyHits').addEventListener('click', async () => {
   // playwright present on host?
   try {
     const s = await fetch('/api/swarm').then(x => x.json());
-    if (!s.available) badge.title = 'swarm: Playwright not installed on host → HYDRA fallback (6 workers in your browser)';
-    else badge.title = 'swarm: Playwright detected — 6 real headless Chromes ready';
+    if (s.browser) badge.title = `swarm: ${s.browser} detected — 6 real browsers ready`;
+    else if (s.available) badge.title = 'swarm: playwright installed but no real browser found — run `npx playwright install chromium` or install Google Chrome';
+    else badge.title = 'swarm: playwright not installed on host → HYDRA fallback (6 real checkers in your browser)';
   } catch (_) {}
 })();
 
@@ -531,7 +567,7 @@ $('#copyHits').addEventListener('click', async () => {
   $('#useLetters').checked = true;
   $('#useDigits').checked = false;
   buildCams();
-  for (let i = 1; i <= N_BROWSERS; i++) state.cams[i] = { current: null, checked: 0, valid: 0, last: '—', sim: false };
+  for (let i = 1; i <= N_BROWSERS; i++) state.cams[i] = { current: null, checked: 0, valid: 0, last: '—' };
   syncPatternUI();
   updateEngineNote();
   poll();

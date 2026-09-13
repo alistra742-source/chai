@@ -80,7 +80,6 @@
     <div class="row engines">
       <label>Engine
         <select id="engine">
-          <option value="demo">Demo (simulation — always works)</option>
           <option value="server">Server (real checks from this machine)</option>
           <option value="browser">Browser-direct (real checks from your browser)</option>
           <option value="swarm">⚡ SWARM — 6 real browsers, same time</option>
@@ -101,6 +100,7 @@
       <button id="stopBtn" class="danger" disabled>■ STOP</button>
       <span class="muted" id="startHint"></span>
     </div>
+    <p class="muted small" id="runError" hidden></p>
 
     <details class="single">
       <summary>Check a single username</summary>
@@ -147,7 +147,7 @@
 
 <!-- ============================ LIVE CAM =========================== -->
 <section class="card camwall" id="camwall">
-  <h2>LIVE CAM — 6 browsers sniping <span class="muted" id="camMode">· idle</span></h2>
+  <h2>LIVE CAM — 6 real browsers sniping <span class="muted" id="camMode">· idle</span></h2>
   <div class="cams" id="cams"></div>
 </section>
 

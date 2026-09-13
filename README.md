@@ -4,6 +4,10 @@ A self-hostable username sniper/availability checker for **guns.lol**, **Discord
 **Instagram** and **TikTok**, with a web dashboard, a **6-browser swarm with a live
 cam wall**, and exact possibility/remaining math.
 
+Every engine in this app is **real** — no simulation, no fake hits. A run either
+hits the platforms (server-side, from your browser, or from 6 browser windows on
+the host) or it reports the errors the platforms give back.
+
 Pick a platform, pick a target pattern (`3L`, `3C`, `4L`, `4C`, custom
 length/charset, or a paste-your-own list), and sweep the whole space while the
 dashboard shows:
@@ -16,7 +20,7 @@ dashboard shows:
 ## Run it
 
 ```bash
-node server.js          # zero dependencies for demo/server/browser engines, Node 18+
+node server.js          # zero dependencies for the server/browser engines, Node 18+
 # open http://localhost:3000
 ```
 
@@ -24,31 +28,42 @@ node server.js          # zero dependencies for demo/server/browser engines, Nod
 
 | Engine | What it does |
 |---|---|
-| **Demo** | Deterministic simulation — works anywhere, even with no internet. |
 | **Server** | Real checks fired from the machine running `server.js`. The actual sniper when self-hosted on your own IP. |
 | **Browser-direct** | Real checks from **your** browser (Discord via the CORS-enabled Pomelo endpoint; others relayed through `/api/proxy`). |
-| **⚡ Swarm** | **SIX real headless Chrome browsers sniping at the same time**, each with a **live screenshot cam** streamed to the dashboard. |
+| **⚡ Swarm** | **SIX real browsers sniping at the same time on the host**, each with a **live screenshot cam** streamed to the dashboard. |
 
 ### Swarm — 6 real browsers + live cam
 
 ```bash
-npm i playwright
-npx playwright install chromium
-node server.js        # pick "⚡ SWARM" in the engine dropdown
+npm i playwright              # only needed for headless host browsers
+node server.js                # pick "⚡ SWARM" in the engine dropdown
 ```
 
+The swarm drives a browser that already exists on the host, in this order:
+
+1. the **Google Chrome** you have installed (`channel: chrome`)
+2. **Microsoft Edge** (`channel: msedge`)
+3. playwright's own **chromium** (`npx playwright install chromium`)
+
+so you do **not** need the `playwright install` download if Chrome or Edge is
+installed. If none of the three exists, the run says so and switches to HYDRA
+instead of dying (see below).
+
 - Launches **6 isolated browser contexts** (6 UA-fingerprinted "browsers"), each pulling
-  names from the shared scramble cursor concurrently.
+  names from the shared scramble cursor concurrently — every name is handed out once.
 - Real page loads per username (`guns.lol/<name>`, `tiktok.com/@<name>`, `instagram.com/<name>/`);
   Discord is checked via `fetch` **from inside a live discord.com page** (real browser TLS/cookies).
 - **LIVE CAM**: every browser's screen is captured ~1×/s (`Page.captureScreenshot`) and served
   at `/api/cam/1.jpg … /api/cam/6.jpg` — the dashboard shows a 6-pane camera wall with
   per-browser target/counters overlaid.
-- **HYDRA fallback**: if Playwright isn't installed on the host, the swarm automatically runs
-  as **6 parallel Web Workers inside your own browser** instead — same cam wall, but the panes
-  stream per-worker telemetry (current target / checked / valid / last status) instead of video.
-  Workers auto-degrade to simulation if the host has no outbound access (badge shows *SIM*).
-  Discord checks stay **real** in HYDRA — they go straight from your browser to Discord.
+- Launch problems are never silent: `/api/state` → `swarm.error` carries the reason
+  (e.g. *"Google Chrome: ... / chromium: Executable doesn't exist"*) and the dashboard
+  shows it under the start/stop buttons.
+- **HYDRA fallback**: if the host has no real browser at all, the swarm runs as
+  **6 parallel Web Workers inside your own browser** — same 6 panes, streaming per-worker
+  telemetry (current target / checked / valid / last status) instead of video. Those workers
+  do **real** checks too: Discord straight from your browser, other platforms via `/api/proxy`.
+  There is no simulated mode to fall back to.
 
 ## Latest GitHub tools this is copied from (updated 2026)
 
@@ -90,18 +105,20 @@ node server.js        # pick "⚡ SWARM" in the engine dropdown
 Custom lengths 1–6 with letters/digits toggles use the same `base^len` math. The sweep order is
 a bijective scramble (`i → (offset + i·mult) mod total`, `gcd(mult, total) = 1`) — random-looking,
 never repeats, never materialises the space in memory, so *left to check* stays exact even with
-6 browsers pulling from the same cursor.
+6 browsers pulling from the same cursor. The server owns that cursor: browser workers ask for
+`/api/targets?n=…` and get names nobody else has, so six browsers can never double-check a name
+(or finish a 17,576-name sweep after the first 2,000).
 
 ## API
 
 | Endpoint | Description |
 |---|---|
 | `GET /api/state` | live counters + swarm mode/worker telemetry + feed |
-| `GET /api/swarm` | playwright available? swarm running? per-browser stats |
+| `GET /api/swarm` | real browser detected? playwright available? swarm running? per-browser stats |
 | `GET /api/cam/1.jpg…6.jpg` | live screenshot of browser N (swarm mode) |
-| `POST /api/start` | `{platform, engine: demo\|server\|browser\|swarm, target, concurrency, delay, shuffle}` |
+| `POST /api/start` | `{platform, engine: server\|browser\|swarm, target, concurrency, delay, shuffle}` |
 | `POST /api/stop` | abort run + kill browsers |
-| `GET /api/targets?start=&n=` | next chunk of names (hydra/browser workers) |
+| `GET /api/targets?n=` | next chunk of names — server-owned cursor, handed out exactly once (hydra/browser workers) |
 | `POST /api/report` | workers post results back |
 | `POST /api/proxy` | server-side batch check (hydra, non-Discord) |
 | `POST /api/check` | single ad-hoc check |

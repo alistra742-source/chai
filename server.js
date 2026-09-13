@@ -5,21 +5,21 @@
  *
  *   node server.js            # PORT=3000 by default, binds 0.0.0.0
  *
- * Engines:
- *   demo    – deterministic simulation, works with no outbound internet
+ * Engines (all real, no simulation):
  *   server  – real checks from this machine (copied GitHub-tool logic)
  *   browser – real checks from YOUR browser (Discord direct via CORS,
  *             others proxied through /api/proxy)
- *   swarm   – SIX real headless Chrome browsers in parallel with live
- *             screenshot cams (needs playwright on host; auto-falls back
- *             to HYDRA — 6 worker threads inside the user's browser)
+ *   swarm   – SIX real headless browsers in parallel with live screenshot
+ *             cams (uses the Chrome/Edge already installed on the host, or
+ *             playwright's chromium; if no real browser exists the run falls
+ *             back to HYDRA — 6 real checkers inside the user's browser)
  */
 
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
-const { liveCheck, demoCheck, CheckError } = require('./lib/checkers');
-const { Swarm, bind, detectPlaywright, swarm } = require('./lib/swarm');
+const { liveCheck } = require('./lib/checkers');
+const { Swarm, bind, detectPlaywright, detectBrowser, swarm } = require('./lib/swarm');
 const {
   describeTarget, totalFor, nameAt, makeOrder, PATTERN_PRESETS, mulberry32,
 } = require('./lib/generator');
@@ -34,6 +34,7 @@ const RESULTS_DIR = path.join(__dirname, 'results');
 const MAX_CONCURRENCY = 24;
 const FEED_CAP = 400;        // recent rows kept for the UI feed
 const AVAILABLE_CAP = 20000; // in-memory list of hits (count keeps going)
+const COUNTED_CAP = 400000;  // names tracked for exact de-duplication
 
 const PLATFORMS = {
   gunslol: { id: 'gunslol', label: 'guns.lol', url: (u) => `https://guns.lol/${u}`, accent: '#ff2e4d' },
@@ -61,6 +62,8 @@ function newRun(cfg) {
     concurrency: cfg.concurrency,
     delay: cfg.delay,
     total,
+    cursor: 0,       // names handed out to browser workers so far (disjoint)
+    counted: new Set(), // every name already recorded — nothing counts twice
     checked: 0,
     available: [],   // names (capped at AVAILABLE_CAP)
     availableCount: 0,
@@ -73,12 +76,17 @@ function newRun(cfg) {
     finishedAt: null,
     running: false,
     abort: false,
+    error: null,     // why a run died (e.g. swarm launch failure) — shown in the UI
     rateWindow: [],  // {t, n} for rolling rate
     lastErrors: [],
   };
 }
 
 function record(state, name, res) {
+  // De-duplicate: a name can only ever count once per run, so "checked" stays
+  // exact even if several browser workers overlap.
+  if (state.counted.has(name)) return;
+  if (state.counted.size < COUNTED_CAP) state.counted.add(name);
   state.checked++;
   const now = Date.now();
   state.rateWindow.push({ t: now, n: 1 });
@@ -116,7 +124,7 @@ function ratePerMin(state) {
 
 function stateSnapshot(state) {
   if (!state) {
-    return { run: null, swarm: { available: !!detectPlaywright(), mode: null, meta: null }, platforms: platformMeta(), presets: PATTERN_PRESETS };
+    return { run: null, swarm: { available: !!detectPlaywright(), browser: detectBrowser(), error: null, mode: null, meta: null }, platforms: platformMeta(), presets: PATTERN_PRESETS };
   }
   const checked = state.checked;
   const rate = state.running ? ratePerMin(state) : 0;
@@ -124,7 +132,9 @@ function stateSnapshot(state) {
   return {
     swarm: {
       available: !!detectPlaywright(),
-      mode: state.engine === 'swarm' ? (swarm.running ? 'playwright' : (detectPlaywright() ? 'playwright' : 'hydra')) : null,
+      browser: detectBrowser(),   // e.g. "Google Chrome", null when none found
+      error: run.error || swarm.lastError || null,
+      mode: state.engine === 'swarm' ? (swarm.running ? 'playwright' : (detectBrowser() ? 'playwright' : 'hydra')) : null,
       meta: swarm.running ? swarm.meta() : null,
     },
     run: {
@@ -134,6 +144,7 @@ function stateSnapshot(state) {
       targetDesc: state.targetDesc,
       total: state.total,
       checked,
+      handedOut: state.cursor,
       availableCount: state.availableCount,
       takenCount: state.takenCount,
       invalidCount: state.invalidCount,
@@ -141,6 +152,7 @@ function stateSnapshot(state) {
       errorCount: state.errorCount,
       remaining,
       running: state.running,
+      error: state.error,
       ratePerMin: rate,
       etaSec: rate > 0 ? Math.round((remaining / rate) * 60) : (state.running && state.total ? null : 0),
       elapsedSec: state.startedAt ? Math.round(((state.finishedAt || Date.now()) - state.startedAt) / 1000) : 0,
@@ -186,29 +198,6 @@ async function runServerEngine(state) {
         const jitter = state.delay * (0.7 + Math.random() * 0.6);
         await sleep(jitter);
       }
-    }
-  };
-
-  await Promise.all(Array.from({ length: nworkers }, worker));
-  state.running = false;
-  state.finishedAt = Date.now();
-}
-
-async function runDemoEngine(state) {
-  state.running = true;
-  state.startedAt = Date.now();
-  const cursor = { i: 0 };
-  const nworkers = Math.max(1, Math.min(MAX_CONCURRENCY, state.concurrency || 8));
-  const charsetKey = state.target.kind === 'pattern' ? state.target.charset : 'C';
-  const len = state.target.kind === 'pattern' ? state.target.len : Math.min(4, (state.target.names ? (state.target.names[0] || '').length : 3) || 3);
-
-  const worker = async () => {
-    while (!state.abort) {
-      const i = cursor.i++;
-      if (i >= state.total) return;
-      const name = nameAt(state.target, state.order, i);
-      record(state, name, demoCheck(state.platform, name, charsetKey, len));
-      if (state.delay > 0) await sleep(state.delay * (0.7 + Math.random() * 0.6));
     }
   };
 
@@ -265,9 +254,9 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && p === '/api/start') {
       const body = await readBody(req);
       const platform = String(body.platform || '');
-      const engine = String(body.engine || 'demo');
+      const engine = String(body.engine || 'server');
       if (!PLATFORMS[platform]) return json(res, 400, { ok: false, error: 'unknown platform' });
-      if (!['demo', 'server', 'browser', 'swarm'].includes(engine)) return json(res, 400, { ok: false, error: 'bad engine' });
+      if (!['server', 'browser', 'swarm'].includes(engine)) return json(res, 400, { ok: false, error: 'bad engine' });
       if (run && run.running && !run.abort) return json(res, 409, { ok: false, error: 'a run is already active — stop it first' });
 
       let target;
@@ -296,17 +285,35 @@ const server = http.createServer(async (req, res) => {
       });
 
       let swarmMode = null;
-      if (engine === 'server') runServerEngine(run).catch(e => { run.running = false; console.error('[SNIPR] server engine crashed:', e); });
-      else if (engine === 'demo') runDemoEngine(run).catch(e => { run.running = false; console.error('[SNIPR] demo engine crashed:', e); });
-      else if (engine === 'swarm' && detectPlaywright()) {
+      let note = null;
+      if (engine === 'server') {
+        runServerEngine(run).catch(e => {
+          run.error = 'server engine crashed: ' + String(e.message || e).slice(0, 180);
+          run.running = false;
+          console.error('[SNIPR] server engine crashed:', e);
+        });
+      } else if (engine === 'swarm' && detectBrowser()) {
         swarmMode = 'playwright';
-        swarm.start(run, 6).catch(e => { console.error('[SNIPR] swarm crashed:', e); run.running = false; });
-      } else { // browser engine, or swarm fallback -> HYDRA (6 workers in the user's browser)
-        if (engine === 'swarm') swarmMode = 'hydra';
+        note = 'swarming with ' + detectBrowser();
+        swarm.start(run, 6).catch(e => {
+          console.error('[SNIPR] swarm crashed:', e);
+          run.error = 'swarm crashed: ' + String(e.message || e).slice(0, 180);
+          run.running = false;
+          run.finishedAt = Date.now();
+        });
+      } else {
+        // browser engine, or swarm with no real browser on the host -> HYDRA:
+        // 6 workers inside the user's browser doing REAL checks.
+        if (engine === 'swarm') {
+          swarmMode = 'hydra';
+          note = detectPlaywright()
+            ? 'no Chrome/Edge found on host — running 6 workers in your browser'
+            : 'playwright not installed on host — running 6 workers in your browser';
+        }
         run.running = true;
         run.startedAt = Date.now();
       }
-      return json(res, 200, { ok: true, runId: run.id, total: run.total, orderSeed: run.order, swarmMode });
+      return json(res, 200, { ok: true, runId: run.id, total: run.total, orderSeed: run.order, swarmMode, note, browser: detectBrowser() });
     }
 
     if (req.method === 'POST' && p === '/api/stop') {
@@ -319,12 +326,10 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req);
       const name = String(body.name || '').trim().toLowerCase();
       const platform = String(body.platform || '');
-      const engine = String(body.engine || 'demo');
       if (!name || !PLATFORMS[platform]) return json(res, 400, { ok: false, error: 'bad request' });
       let out;
       try {
-        if (engine === 'demo') out = { name, ...demoCheck(platform, name, /[0-9]/.test(name) ? 'C' : 'L', name.length) };
-        else out = { name, ...(await liveCheck(platform, name)) };
+        out = { name, ...(await liveCheck(platform, name)) };
       } catch (e) {
         out = { name, status: 'error', note: String(e.message || e).slice(0, 140) };
       }
@@ -344,9 +349,9 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { results: out });
     }
 
-    if (req.method === 'POST' && p === '/api/report') { // hydra/browser engine reports results
+    if (req.method === 'POST' && p === '/api/report') { // browser/hydra workers report results
       const body = await readBody(req);
-      if (run && (run.engine === 'browser' || run.engine === 'swarm') && run.running && Array.isArray(body.results)) {
+      if (run && (run.engine === 'browser' || run.engine === 'swarm') && !run.abort && Array.isArray(body.results)) {
         for (const r of body.results.slice(0, 200)) {
           record(run, String(r.name || '').toLowerCase(), { status: r.status, via: r.via, note: r.note });
         }
@@ -355,20 +360,25 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true });
     }
 
-    if (req.method === 'GET' && p === '/api/targets') { // hydra/browser engine pulls the next chunk of names
+    if (req.method === 'GET' && p === '/api/targets') {
+      // browser/hydra workers pull the next chunk. The SERVER owns the cursor,
+      // so every name is handed out exactly once — no duplicate work, no early
+      // "finish" caused by the same name being reported by several workers.
       if (!run || (run.engine !== 'browser' && run.engine !== 'swarm')) return json(res, 400, { ok: false, error: 'no active browser run' });
-      const start = Math.max(0, Number(u.searchParams.get('start')) || 0);
       const n = Math.max(1, Math.min(60, Number(u.searchParams.get('n')) || 25));
+      const start = run.cursor;
       const names = [];
-      for (let k = 0; k < n && start + k < run.total; k++) {
-        names.push(nameAt(run.target, run.order, start + k));
+      while (names.length < n && run.cursor < run.total) {
+        names.push(nameAt(run.target, run.order, run.cursor++));
       }
-      return json(res, 200, { names, total: run.total });
+      return json(res, 200, { names, start, next: run.cursor, total: run.total, done: run.cursor >= run.total });
     }
 
     if (req.method === 'GET' && p === '/api/swarm') {
       return json(res, 200, {
         available: !!detectPlaywright(),
+        browser: detectBrowser(),
+        error: swarm.lastError || null,
         mode: swarm.running ? 'playwright' : 'idle',
         meta: swarm.running ? swarm.meta() : null,
       });
@@ -403,5 +413,7 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, HOST, () => {
   console.log(`[SNIPR] listening on http://${HOST}:${PORT}`);
   const pw = detectPlaywright();
-  console.log(`[SNIPR] engines: demo | server | browser | swarm (playwright: ${pw ? 'yes' : 'no -> HYDRA fallback'})`);
+  const browser = detectBrowser();
+  console.log(`[SNIPR] engines: server | browser | swarm — real checks only (no demo)`);
+  console.log(`[SNIPR] playwright: ${pw ? 'yes' : 'no'} · real browser: ${browser || 'none found (swarm falls back to 6 in-browser workers)'}`);
 });
