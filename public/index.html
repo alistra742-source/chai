@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SNIPR — guns.lol / Discord / IG / TikTok username sniper</title>
+<link rel="stylesheet" href="/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='80' font-size='80'>🎯</text></svg>">
+</head>
+<body>
+<header>
+  <div class="logo">SNIP<span>R</span></div>
+  <div class="tagline">multi-platform username sniper · <b>guns.lol</b> · <b>Discord</b> · <b>Instagram</b> · <b>TikTok</b></div>
+  <div class="engine-live" id="netBadge" title="outbound status of the server running this app">● checking network…</div>
+</header>
+
+<main>
+  <!-- ============================ CONFIG ============================ -->
+  <section class="card config">
+    <h2>1 · Pick platform</h2>
+    <div class="platforms" id="platforms">
+      <button class="platform" data-platform="gunslol">
+        <span class="p-icon">🔫</span><span class="p-name">guns.lol</span>
+        <span class="p-note">bio-link OG names</span>
+      </button>
+      <button class="platform" data-platform="discord">
+        <span class="p-icon">🎮</span><span class="p-name">Discord</span>
+        <span class="p-note">Pomelo unauthed API</span>
+      </button>
+      <button class="platform" data-platform="instagram">
+        <span class="p-icon">📸</span><span class="p-name">Instagram</span>
+        <span class="p-note">web_profile_info</span>
+      </button>
+      <button class="platform" data-platform="tiktok">
+        <span class="p-icon">🎵</span><span class="p-name">TikTok</span>
+        <span class="p-note">unique/id/check API</span>
+      </button>
+    </div>
+
+    <h2>2 · Pick targets</h2>
+    <div class="tabs">
+      <button class="tab active" data-tab="pattern">Pattern (3L / 3C / 4L / 4C)</button>
+      <button class="tab" data-tab="list">Custom list</button>
+    </div>
+
+    <div id="tab-pattern">
+      <div class="chips">
+        <button class="chip" data-len="3" data-charset="L">
+          <b>3L</b><i>3 letters</i><em>26³ = <span>17,576</span></em>
+        </button>
+        <button class="chip" data-len="3" data-charset="C">
+          <b>3C</b><i>3 chars a-z0-9</i><em>36³ = <span>46,656</span></em>
+        </button>
+        <button class="chip" data-len="4" data-charset="L">
+          <b>4L</b><i>4 letters</i><em>26⁴ = <span>456,976</span></em>
+        </button>
+        <button class="chip" data-len="4" data-charset="C">
+          <b>4C</b><i>4 chars a-z0-9</i><em>36⁴ = <span>1,679,616</span></em>
+        </button>
+      </div>
+      <details class="custom-len">
+        <summary>Custom length / charset</summary>
+        <div class="row">
+          <label>Length <b id="lenVal">5</b>
+            <input type="range" id="lenRange" min="1" max="6" value="5">
+          </label>
+          <label class="chk"><input type="checkbox" id="useLetters" checked> letters a-z</label>
+          <label class="chk"><input type="checkbox" id="useDigits" checked> digits 0-9</label>
+          <output id="customCount">—</output>
+        </div>
+      </details>
+    </div>
+
+    <div id="tab-list" hidden>
+      <textarea id="nameList" rows="6" placeholder="paste usernames, one per line (or comma separated)&#10;e.g. owner&#10;purz&#10;k4ito&#10;zz9"></textarea>
+      <div class="muted" id="listCount">0 usernames</div>
+    </div>
+
+    <h2>3 · Engine & speed</h2>
+    <div class="row engines">
+      <label>Engine
+        <select id="engine">
+          <option value="demo">Demo (simulation — always works)</option>
+          <option value="server">Server (real checks from this machine)</option>
+          <option value="browser">Browser-direct (real checks from your browser)</option>
+          <option value="swarm">⚡ SWARM — 6 real browsers, same time</option>
+        </select>
+      </label>
+      <label>Threads <b id="concVal">8</b>
+        <input type="range" id="concurrency" min="1" max="24" value="8">
+      </label>
+      <label>Delay/req <b id="delayVal">150ms</b>
+        <input type="range" id="delay" min="0" max="2000" step="25" value="150">
+      </label>
+      <label class="chk"><input type="checkbox" id="shuffle" checked> shuffled order</label>
+    </div>
+    <p class="muted small" id="engineNote"></p>
+
+    <div class="row actions">
+      <button id="startBtn" class="primary">▶ START SNIPING</button>
+      <button id="stopBtn" class="danger" disabled>■ STOP</button>
+      <span class="muted" id="startHint"></span>
+    </div>
+
+    <details class="single">
+      <summary>Check a single username</summary>
+      <div class="row">
+        <input type="text" id="singleName" placeholder="username…">
+        <button id="singleBtn">check</button>
+        <span id="singleOut" class="pill">—</span>
+      </div>
+    </details>
+  </section>
+
+  <!-- ============================ STATS ============================= -->
+  <section class="card stats">
+    <h2 id="runTitle">Run stats <span class="muted" id="runDesc">— no run yet</span></h2>
+    <div class="progress"><div id="progressBar"></div></div>
+    <div class="tiles">
+      <div class="tile"><em>possibilities</em><b id="stTotal">0</b></div>
+      <div class="tile"><em>checked</em><b id="stChecked">0</b></div>
+      <div class="tile ok"><em>valid (free)</em><b id="stValid">0</b></div>
+      <div class="tile bad"><em>taken</em><b id="stTaken">0</b></div>
+      <div class="tile warn"><em>invalid</em><b id="stInvalid">0</b></div>
+      <div class="tile prem"><em>premium 💎</em><b id="stPremium">0</b></div>
+      <div class="tile warn"><em>errors</em><b id="stErrors">0</b></div>
+      <div class="tile hl"><em>left to check</em><b id="stLeft">0</b></div>
+      <div class="tile"><em>speed /min</em><b id="stRate">0</b></div>
+      <div class="tile"><em>ETA</em><b id="stEta">—</b></div>
+    </div>
+
+    <div class="feed-head">
+      <div class="tabs small">
+        <button class="tab active" data-feed="all">All</button>
+        <button class="tab" data-feed="available">Valid ✅</button>
+        <button class="tab" data-feed="taken">Taken ❌</button>
+        <button class="tab" data-feed="error">Errors ⚠</button>
+      </div>
+      <div class="feed-actions">
+        <button id="copyHits" title="copy valid usernames">⧉ copy valid</button>
+        <a id="dlHits" href="/api/hits.txt" download>⬇ hits.txt</a>
+      </div>
+    </div>
+    <div class="feed" id="feed"><div class="muted empty">start a run to see results stream in…</div></div>
+  </section>
+</main>
+
+<!-- ============================ LIVE CAM =========================== -->
+<section class="card camwall" id="camwall">
+  <h2>LIVE CAM — 6 browsers sniping <span class="muted" id="camMode">· idle</span></h2>
+  <div class="cams" id="cams"></div>
+</section>
+
+<footer>
+  <span>checkers ported from open-source GitHub tools: <b>xnxv/guns.lol.scanner</b> · <b>M58-ENSIBS/guns.lol-fetcher</b> · <b>daskeptaxd/username-checker</b> · <b>swagkarna/TikTok-Username-Checker</b> · <b>efekrbas/guns.lol-username-checker</b> (2026, browser detection + premium filter) · <b>CuteTenshii/guns-solver</b> (2026, cf_clearance intel) — see README</span>
+  <span class="muted">educational tool — respect each platform's ToS, keep delays on, don't hammer</span>
+</footer>
+
+<script src="/app.js"></script>
+</body>
+</html>
