@@ -120,19 +120,37 @@ checker, so **server, browser-relayed and swarm** checks all go through it.
   where the `HTTP 429 (Cloudflare challenge?)` rows came from, and the `401`s
   once a clearance cookie minted for one exit was replayed from another. The
   cookie is stored per host and sent back, which turns the same check into
-  `200` + `Username not found`. Cookies are remembered *between* checks only
-  when the exit never changes (direct, or Tor without per-connection
-  isolation).
+  `200` + `Username not found`.
+- **Cookies follow the exit that earned them.** The jar is keyed to the current
+  egress identity (`identityTag()`), and is emptied when that identity changes —
+  including on every `SIGNAL NEWNYM`. So a clearance/bot cookie can never be
+  replayed from an IP the platform has already refused. In the modes where the
+  exit changes on its own (proxy list: per request · isolated Tor: per
+  connection) cookies live only for their own redirect chain.
 - **One exit IP per check.** All redirect hops of a single check share one proxy
   route, so a cookie minted on hop 1 is still valid on hop 2. Rotation still
   happens per check, not per hop.
 - **Bounded retries.** `429 / 403 / 503` on a GET are retried (up to 3 attempts)
   with backoff, honouring `Retry-After`, each attempt on a fresh route. POST is
-  never retried, so a Discord availability check can't be submitted twice.
-- **Adaptive back-off.** When the server engine sees a rate-limit/block from the
-  target, every worker pauses (2 s, doubling to 30 s, decaying again on healthy
-  answers) and the dashboard shows `⏸ … is throttling this IP` instead of a wall
-  of identical error rows.
+  never retried, so a Discord availability check can't be submitted twice. A
+  `401` is retried the same way **only when the retry can land on another exit**
+  (proxy list, or isolated Tor circuits): a 401 means *this exit* was refused, and
+  asking again from the same IP only adds rejected requests.
+- **Rejected exits are skipped, not reused.** `401 / 403 / 429` marks that exit in
+  `status().blocked`; in **proxy list** mode the next request prefers an exit that
+  has not just been refused (60 s cooldown, 30 s for a rate limit; cleared when
+  the route changes).
+  Without this a sweep keeps asking the same three dirty proxies forever — which
+  is what a full wordlist of `401`s looks like.
+- **Adaptive back-off.** When the server engine sees a rate limit (`429`), every
+  worker pauses (2 s, doubling to 30 s, decaying again on healthy answers) and the
+  dashboard shows `⏸ … is throttling this IP` instead of a wall of identical rows.
+- **A wall of blocks stops the run.** `401/403` are *not* a rate limit — pausing
+  cannot un-block an IP — so instead they are counted: after **12 straight
+  blocks** with no healthy answer in between, the run stops and `run.error` says
+  exactly that (`every check is being rejected — stopped after 12 straight blocks: …`)
+  instead of turning a 46,656-name sweep into 46,656 error rows. The same guard
+  exists in the swarm (`every browser is being blocked`).
 - **A route that cannot be dialled is refused, not blamed on the site.** This is
   what a wall of `exception — network error reaching …` rows usually means: Tor
   is not running, a proxy host/port is wrong, or the proxy is dead — so every
@@ -188,6 +206,13 @@ keeps showing requests routed, new identities issued and exits seen.
   and prefer your own IP or a proxy list where Tor fails. Better still: leave
   the route **off** for guns.lol on a normal connection now that the clearance
   cookie is replayed — the 429s there were self-inflicted, not Cloudflare.
+- **If you see `guns.lol rejected this IP (HTTP 401)` for every name**, that is
+  Cloudflare refusing the exit, not the usernames: it is the *route* that needs
+  changing (route **off** on a normal connection, or a residential proxy list),
+  not the delay. With a rotating route the same message says *"rejected every
+  exit we tried"*, which means all of the route's exits are flagged. The run
+  stops after 12 in a row instead of grinding on — nothing is silently scored as
+  `taken`.
 - **Tor mode needs a Tor daemon on the same machine as this app.** The Freebuff
   sandbox (and most hosting containers) has no `tor` binary and nothing on port
   9050, so selecting 🧅 Tor there fails every request — which is exactly the
@@ -195,8 +220,11 @@ keeps showing requests routed, new identities issued and exits seen.
   list** (`socks5://…` / `http://…`, e.g. a residential proxy provider) or leave
   the route **off** in the sandbox, and run Tor locally if you want circuits.
 
-Run the proxy test suite (mock SOCKS5 server, mock CONNECT proxy, mock Tor
-control port, real HTTPS through the tunnel):
+Every one of the behaviours above is covered — cookie replay, one exit per
+redirect chain, cookies dropped on a Tor rotation, 401 retried only when the
+route can rotate, rejected exits skipped, identity/route health. Run the proxy
+test suite (mock SOCKS5 server, mock CONNECT proxy, mock Tor control port, real
+HTTPS through the tunnel):
 
 ```bash
 npm test        # node test/net.test.js

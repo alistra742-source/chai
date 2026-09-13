@@ -184,6 +184,8 @@ async function startOrigin() {
       return res.end('finally');
     }
     if (url === '/always-429') { res.writeHead(429, { 'retry-after': '0.02' }); return res.end('no'); }
+    // a target that refuses this exit (guns.lol from a flagged IP answers 401)
+    if (url === '/reject') { res.writeHead(401, { 'content-type': 'text/html' }); return res.end('<html><title>Error</title><h1>not for you</h1></html>'); }
     if (url === '/echo') {
       const chunks = [];
       req.on('data', c => chunks.push(c));
@@ -467,6 +469,103 @@ async function startOrigin() {
       return true;
     });
     pool.setConfig({ mode: 'off' });
+  });
+
+  await test('identityTag() keys cookies to the exit that earned them', async () => {
+    pool.setConfig({ mode: 'off' });
+    assert.strictEqual(pool.identityTag(), 'direct');
+    pool.setConfig({ mode: 'list', list: [`http://127.0.0.1:${httpProxy.port}`] });
+    assert.strictEqual(pool.identityTag(), null, 'list mode uses a new proxy per request');
+    pool.setConfig({ mode: 'tor', torSocks: `socks5://127.0.0.1:${socks.port}`, torControl: '', isolate: true });
+    assert.strictEqual(pool.identityTag(), null, 'isolated circuits must not share cookies');
+
+    pool.setConfig({ mode: 'tor', isolate: false, torControl: `127.0.0.1:${control.port}`, rotateEvery: 0 });
+    const tag = pool.identityTag();
+    assert.ok(tag && tag.startsWith('tor-circuit-'), `unexpected tag ${tag}`);
+    await pool.torNewNym();
+    assert.notStrictEqual(pool.identityTag(), tag, 'a NEWNYM rotation must invalidate the cookie identity');
+    pool.setConfig({ mode: 'off' });
+  });
+
+  await test('a Tor rotation drops the cookies minted on the last circuit', async () => {
+    // the bug this guards: tor without per-connection isolation kept one cookie
+    // jar across SIGNAL NEWNYM, so guns_clearance minted on exit A was replayed
+    // from exit B — which is what earns a wall of 401s.
+    pool.setConfig({
+      mode: 'tor', torSocks: `socks5://127.0.0.1:${socks.port}`,
+      torControl: `127.0.0.1:${control.port}`, torPassword: '',
+      rotateEvery: 0, isolate: false,
+    });
+    await fetchWithTimeout(`${originUrl}/needs-cookie`, {}, 8000);   // warm this circuit's jar
+    const base = origin.state.hits.get('/needs-cookie') || 0;
+
+    let res = await fetchWithTimeout(`${originUrl}/needs-cookie`, {}, 8000);
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual((origin.state.hits.get('/needs-cookie') || 0) - base, 1,
+      'the clearance cookie was not reused while the circuit was stable');
+
+    await pool.torNewNym();                                          // the exit changes here
+    res = await fetchWithTimeout(`${originUrl}/needs-cookie`, {}, 8000);
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual((origin.state.hits.get('/needs-cookie') || 0) - base, 3,
+      'a clearance cookie minted on the previous circuit was replayed after the rotation');
+    pool.setConfig({ mode: 'off' });
+  });
+
+  await test('canRotate() is true only when a retry can land on another exit', async () => {
+    pool.setConfig({ mode: 'off' });
+    assert.strictEqual(pool.canRotate(), false);
+    pool.setConfig({ mode: 'list', list: [`http://127.0.0.1:${httpProxy.port}`] });
+    assert.strictEqual(pool.canRotate(), false, 'one proxy is not a rotation');
+    pool.setConfig({ mode: 'list', list: [`http://127.0.0.1:${httpProxy.port}`, `http://127.0.0.1:${httpProxy2.port}`] });
+    assert.strictEqual(pool.canRotate(), true);
+    pool.setConfig({ mode: 'tor', torSocks: `socks5://127.0.0.1:${socks.port}`, torControl: '', isolate: false });
+    assert.strictEqual(pool.canRotate(), false, 'no per-connection isolation → the retry keeps the same exit');
+    pool.setConfig({ isolate: true });
+    assert.strictEqual(pool.canRotate(), true);
+    pool.setConfig({ mode: 'off' });
+  });
+
+  await test('a 401 is not retried when the exit cannot change', async () => {
+    pool.setConfig({ mode: 'off' });
+    const before = origin.state.hits.get('/reject') || 0;
+    const res = await fetchWithTimeout(`${originUrl}/reject`, {}, 8000);
+    assert.strictEqual(res.status, 401);
+    assert.strictEqual((origin.state.hits.get('/reject') || 0) - before, 1,
+      'a rejected IP was asked again from the same exit');
+  });
+
+  await test('a 401 is retried on a fresh exit, and that exit is remembered as blocked', async () => {
+    pool.setConfig({ mode: 'off' });                       // clears blocked exits
+    pool.setConfig({ mode: 'list', list: [`http://127.0.0.1:${httpProxy.port}`, `http://127.0.0.1:${httpProxy2.port}`] });
+    const before = origin.state.hits.get('/reject') || 0;
+    const res = await fetchWithTimeout(`${originUrl}/reject`, {}, 8000);
+    assert.strictEqual(res.status, 401);
+    assert.ok((origin.state.hits.get('/reject') || 0) - before >= 2,
+      'the 401 was not retried on another exit');
+    assert.ok(pool.status().blocked.length >= 1, 'the rejected exit was not remembered');
+    pool.setConfig({ mode: 'off' });
+  });
+
+  await test('an exit the target rejected is skipped while it cools down', async () => {
+    const dead = `http://127.0.0.1:${httpProxy.port}`;
+    const live = `http://127.0.0.1:${httpProxy2.port}`;
+    pool.setConfig({ mode: 'off' });
+    pool.setConfig({ mode: 'list', list: [dead, live] });
+    pool.noteBlocked(dead, 30000);
+    assert.ok(pool.status().blocked.includes(dead), 'noteBlocked() did not record the exit');
+    assert.strictEqual(pool.isBadExit(dead), true);
+    assert.strictEqual(pool.isBadExit(live), false);
+
+    const a = httpProxy.state.connects;
+    const b = httpProxy2.state.connects;
+    const res = await fetchWithTimeout(`${originUrl}/hello`, {}, 8000);
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(httpProxy.state.connects - a, 0, 'the rejected exit was used again');
+    assert.strictEqual(httpProxy2.state.connects - b, 1, 'the healthy exit was not preferred');
+
+    pool.setConfig({ mode: 'off' });
+    assert.strictEqual(pool.isBadExit(dead), false, 'changing route must clear the blocked exits');
   });
 
   made.push(origin, socks, socksAuth, httpProxy, httpProxy2, control, controlPw);

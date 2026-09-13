@@ -202,6 +202,11 @@ const THROTTLE_MAX_MS = 30000;
  * and say so instead. */
 const PROXY_FAILS_BEFORE_ABORT = 3;
 
+/* Same idea for a target that refuses every request: once a whole batch comes
+ * back 401/403 with no healthy answer in between, the run is not unlucky — it is
+ * blocked. Stop and say why instead of turning the wordlist into error rows. */
+const BLOCKED_BEFORE_ABORT = 12;
+
 function throttle(state) {
   state.throttleHits = Math.min(6, (state.throttleHits || 0) + 1);
   const wait = Math.min(THROTTLE_MAX_MS, THROTTLE_BASE_MS * Math.pow(2, state.throttleHits - 1));
@@ -214,6 +219,7 @@ async function runServerEngine(state) {
   state.startedAt = Date.now();
   const cursor = { i: 0 };
   let proxyFails = 0;
+  let blockedFails = 0;
   const nworkers = Math.max(1, Math.min(MAX_CONCURRENCY, state.concurrency || 5));
 
   const pauseWhileCooling = async () => {
@@ -247,8 +253,20 @@ async function runServerEngine(state) {
         }
       } else if (res.status !== 'error') {
         proxyFails = 0;
+        blockedFails = 0;
         state.throttleHits = Math.max(0, state.throttleHits - 1);
-      } else if (res.kind === 'ratelimited' || res.kind === 'blocked') throttle(state);
+      } else if (res.kind === 'blocked') {
+        // A refused exit is not a rate limit: pausing changes nothing about an
+        // IP the target has decided to reject, so count the wall and stop.
+        blockedFails++;
+        if (blockedFails >= BLOCKED_BEFORE_ABORT && !state.abort) {
+          state.error = `every check is being rejected — stopped after ${blockedFails} straight blocks: ${res.note}`;
+          state.abort = true;
+        }
+      } else if (res.kind === 'ratelimited') {
+        blockedFails = 0;
+        throttle(state);
+      }
       record(state, name, res);
       if (state.delay > 0) {
         const jitter = state.delay * (0.7 + Math.random() * 0.6);
