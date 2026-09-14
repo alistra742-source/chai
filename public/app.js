@@ -39,6 +39,7 @@ const state = {
   camAt: [0, 0, 0, 0, 0, 0],
   cams: {},               // workerId -> telemetry {current,checked,valid,last}
   net: null,              // last proxy status from the server
+  torBusy: false,         // a start/stop is in flight (button stays disabled)
   netFilled: false,       // controls seeded from the server once
   netToastUntil: 0,       // keep a test/apply result on screen briefly
 };
@@ -172,43 +173,115 @@ function netLabel(p) {
 }
 
 /* ---------------------- tor daemon (start/stop) -------------------------- */
-function renderTor(t) {
-  if (!t) return;
+/* Two shapes reach this: proxyPool.status().tor = {binary, daemon:{…}} and the
+ * flat torLayer.status() the /api/net/tor calls answer with. Normalise both. */
+function torState(t) {
+  if (!t) return null;
+  const d = t.daemon || t;
+  return {
+    binary: t.binary || d.binary || '',
+    canInstall: t.canInstall !== false && d.canInstall !== false,
+    install: d.install || t.install || null,
+    running: !!d.running,
+    reused: !!d.reused,
+    socks: d.socks || '',
+    control: d.control || '',
+    hasPassword: !!d.hasPassword,
+    bootstrap: Number(d.bootstrap) || 0,
+    version: d.version || '',
+    error: d.error || null,
+    source: d.source || '',
+  };
+}
+
+/* The one-line "what is it doing right now" for a start in flight. */
+function torProgress(d) {
+  if (!d) return '';
+  const i = d.install || {};
+  if (i.phase === 'failed' || i.phase === 'ready') return '';   // nothing in flight
+  const mb = (n) => (n / 1048576).toFixed(1) + ' MB';
+  if (i.phase === 'resolving') return 'looking up the current Tor release…';
+  if (i.phase === 'checksums') return `downloading Tor ${i.version} — fetching the published checksum…`;
+  if (i.phase === 'downloading') {
+    return i.total
+      ? `downloading Tor ${i.version} — ${i.pct}% (${mb(i.bytes)} of ${mb(i.total)})`
+      : `downloading Tor ${i.version} — ${mb(i.bytes || 0)}`;
+  }
+  if (i.phase === 'verifying') return `verifying the Tor download (SHA-256)…`;
+  if (i.phase === 'extracting') return `unpacking Tor ${i.version}…`;
+  if (d.running && d.bootstrap < 100) return `Tor is up, bootstrapping into the network — ${d.bootstrap}%`;
+  return '';
+}
+
+function renderTor(t, busy) {
+  const d = torState(t);
+  if (!d) return;
   const el = $('#torDaemon');
   if (!el) return;
-  const d = t.daemon || {};
   let text, cls = '';
-  if (d.error && !d.running) { text = '🧅 Tor daemon: ' + d.error; cls = 'warn'; }
+  const progress = torProgress(d);
+  if (progress) { text = '🧅 ' + progress; cls = 'warn'; }
+  else if (d.error && !d.running) { text = '🧅 Tor: ' + d.error; cls = 'warn'; }
   else if (d.running) {
     const ctl = d.control
       ? ` · control ${d.control}${d.hasPassword ? ' (app-managed)' : ''}`
       : ' · no control port (circuit isolation only)';
-    text = `🧅 Tor daemon: running on ${d.socks}${ctl} · bootstrapped ${d.bootstrap}%${d.version ? ' · tor ' + d.version : ''}${d.reused ? ' · adopted' : ''}`;
+    text = `🧅 Tor: running on ${d.socks}${ctl} · bootstrapped ${d.bootstrap}%${d.version ? ' · tor ' + d.version : ''}${d.reused ? ' · adopted' : ''}`;
     cls = 'ok';
-  } else if (t.binary) text = `🧅 Tor daemon: not running — ${t.binary} is installed, press ▶ start Tor`;
-  else text = '🧅 Tor daemon: no tor binary on this host (apt-get install tor · brew install tor) and nothing answering on 9050/9150 — use a proxy list, or leave the route direct';
+  } else if (d.binary) {
+    const cached = d.install && d.install.source && d.install.source !== 'system';
+    const ver = (d.install && d.install.version) ? ` ${d.install.version}` : '';
+    text = cached
+      ? `🧅 Tor:${ver} is ready (fetched earlier and cached) — press ▶ start Tor`
+      : `🧅 Tor: not running — ${d.binary} is installed, press ▶ start Tor`;
+  }
+  else if (!d.canInstall) text = '🧅 Tor: no tor binary on this host and no official build for this platform — install Tor yourself (apt-get install tor · brew install tor), or use a proxy list / the direct route';
+  else text = '🧅 Tor: no tor binary on this host — press ▶ start Tor and the app fetches the official Tor bundle once (~32 MB), then runs it';
   el.textContent = text;
   el.className = 'muted small' + (cls ? ' ' + cls : '');
   const start = $('#torStart');
   const stop = $('#torStop');
-  if (start) start.disabled = !!d.running || !t.binary;
-  if (stop) stop.disabled = !d.running || !!d.reused;
+  if (start) {
+    start.disabled = busy || d.running || !d.canInstall;
+    start.title = d.binary
+      ? 'run the Tor daemon on this host'
+      : 'download the official Tor bundle (~32 MB, once) and run it';
+  }
+  if (stop) stop.disabled = busy || !d.running || d.reused;
+  return d;
+}
+
+function postTor(payload) {
+  return fetch('/api/net/tor', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload),
+  }).then(r => r.json()).catch(() => null);
 }
 
 async function torAction(action) {
-  const start = $('#torStart');
-  const stop = $('#torStop');
-  if (start) start.disabled = true;
-  if (stop) stop.disabled = true;
-  state.netToastUntil = Date.now() + 120000;   // bootstrapping can take a while: don't overwrite this line
-  setNetStatus(action === 'start' ? '🧅 starting a local Tor daemon (bootstrapping can take ~30s)…' : '🧅 stopping Tor…');
-  const j = await fetch('/api/net/tor', {
-    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ action }),
-  }).then(r => r.json()).catch(() => null);
+  if (state.torBusy) return;
+  state.torBusy = true;
+  // a first start downloads Tor and bootstraps a circuit: a minute is normal,
+  // so poll the status while it runs instead of showing a frozen button
+  const poll = action === 'start'
+    ? setInterval(async () => {
+      const s = await postTor({ action: 'status' });
+      if (!s || !s.tor) return;
+      const d = renderTor(s.tor, true);
+      const line = torProgress(d);
+      if (line) setNetStatus('🧅 ' + line);
+    }, 1200)
+    : null;
+  renderTor(state.net ? state.net.tor : null, true);
+  state.netToastUntil = Date.now() + 600000;   // never overwrite this line mid-flight
+  setNetStatus(action === 'start' ? '🧅 starting Tor…' : '🧅 stopping Tor…');
+
+  const j = await postTor({ action });
+  if (poll) clearInterval(poll);
+  state.torBusy = false;
   state.netToastUntil = 0;
-  if (!j) { setNetStatus('⚠ server unreachable', 'warn'); return; }
-  renderTor(j.tor);
+  if (!j) { renderTor(state.net && state.net.tor); setNetStatus('⚠ server unreachable', 'warn'); return; }
   if (j.proxy) state.net = j.proxy;
+  renderTor(j.proxy ? j.proxy.tor : j.tor);
   if (action === 'start' && j.started && j.started.socks) {
     $('#proxyMode').value = 'tor';
     $('#torSocks').value = j.started.socks;
@@ -227,9 +300,13 @@ async function torAction(action) {
     showSuggest(j.route);
     return;
   }
+  const s = j.started || {};
+  const how = s.source === 'downloaded' ? 'fetched + started Tor'
+    : s.source === 'cache' ? 'started the Tor we fetched earlier'
+      : s.reused ? 'using the Tor on' : 'started Tor on';
   state.netToastUntil = Date.now() + 8000;
   setNetStatus(action === 'start'
-    ? `🧅 ${j.started && j.started.reused ? 'using the Tor on' : 'started Tor on'} ${(j.started && j.started.socks) || '127.0.0.1:9050'} — route applied${j.started && j.started.note ? ' · ' + j.started.note : ''}`
+    ? `🧅 ${how} ${s.socks || '127.0.0.1:9050'} — route applied${s.note ? ' · ' + s.note : ''}`
     : '🧅 Tor stopped — the route still points at it: start it again or set the route to direct',
   action === 'start' ? 'ok' : 'warn');
 }
@@ -265,7 +342,9 @@ function showSuggest(route) {
 function renderNet(p) {
   if (!p) return;
   state.net = p;
-  renderTor(p.tor);
+  // while a start/install is in flight the state poll must not re-enable the
+  // button underneath it
+  renderTor(p.tor, state.torBusy);
   if (Date.now() < state.netToastUntil) return;
   setNetStatus(netLabel(p), p.mode === 'off' ? '' : 'tor');
   if (state.netFilled) return;

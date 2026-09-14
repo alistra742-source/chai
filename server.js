@@ -503,10 +503,11 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: route.ok, route, proxy: proxyPool.status(), tor: torLayer.status() });
     }
 
-    /* Start/stop a local Tor daemon (lib/tor.js). Nothing is installed here: if
-     * there is no `tor` binary the answer says so plus what to install. When a
-     * daemon does come up, the route is switched to it in the same call, so one
-     * click takes Tor mode from "route does not answer" to a working route. */
+    /* Start/stop a local Tor daemon (lib/tor.js). One click has to be enough:
+     * with no `tor` binary on the host we fetch the official Tor Expert Bundle
+     * ourselves (lib/torbundle.js), so this call can take ~30s on the first use
+     * (32 MB download + bootstrap). `install:false` skips the download, and
+     * `action:'status'` is cheap — the dashboard polls it while a start runs. */
     if (req.method === 'POST' && p === '/api/net/tor') {
       const body = await readBody(req);
       const action = String(body.action || 'status').toLowerCase();
@@ -516,8 +517,11 @@ const server = http.createServer(async (req, res) => {
           return json(res, 200, { ok: true, stopped, tor: torLayer.status(), proxy: proxyPool.status() });
         }
         if (action === 'start') {
-          const started = await torLayer.start({ socksPort: Number(body.socksPort) || undefined });
-          if (!started.ok) return json(res, 200, { ok: false, error: started.error, tor: torLayer.status(), proxy: proxyPool.status() });
+          const started = await torLayer.start({
+            socksPort: Number(body.socksPort) || undefined,
+            allowDownload: body.install !== false,
+          });
+          if (!started.ok) return json(res, 200, { ok: false, error: started.error, started, tor: torLayer.status(), proxy: proxyPool.status() });
           const proxy = proxyPool.setConfig({
             mode: 'tor',
             torSocks: started.socks,

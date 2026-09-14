@@ -18,9 +18,15 @@
 const net = require('net');
 const http = require('http');
 const assert = require('assert');
+const crypto = require('crypto');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const zlib = require('zlib');
 
 const pool = require('../lib/proxy');
 const torLayer = require('../lib/tor');
+const bundle = require('../lib/torbundle');
 const { fetchWithTimeout, exitCheck } = require('../lib/http');
 const { liveCheck } = require('../lib/checkers');
 
@@ -213,6 +219,81 @@ async function startOrigin() {
   });
   const port = await listen(server);
   return { port, state, close: () => server.close() };
+}
+
+/* ------------------- mock Tor Project download server --------------------- */
+function tarHeader(name, size, mode, type) {
+  const h = Buffer.alloc(512);
+  h.write(name, 0, 100, 'utf8');
+  h.write(mode.toString(8).padStart(7, '0') + '\0', 100, 8, 'utf8');
+  h.write('0000000\0', 108, 8, 'utf8');
+  h.write('0000000\0', 116, 8, 'utf8');
+  h.write(size.toString(8).padStart(11, '0') + '\0', 124, 12, 'utf8');
+  h.write('00000000000\0', 136, 12, 'utf8');
+  h.write('        ', 148, 8, 'utf8');
+  h.write(type, 156, 1, 'utf8');
+  h.write('ustar\0', 257, 6, 'utf8');
+  h.write('00', 263, 2, 'utf8');
+  let sum = 0;
+  for (let i = 0; i < 512; i++) sum += h[i];
+  h.write(sum.toString(8).padStart(6, '0') + '\0 ', 148, 8, 'utf8');
+  return h;
+}
+
+/* A real (small) tar.gz, so the extractor is exercised against tar itself and
+ * not against a hand-rolled parser. */
+function tarGz(entries) {
+  const parts = [];
+  for (const e of entries) {
+    const type = e.type || '0';
+    const data = Buffer.isBuffer(e.data) ? e.data : Buffer.from(e.data || '');
+    parts.push(tarHeader(e.name, type === '5' ? 0 : data.length, e.mode || 0o644, type));
+    if (type !== '5' && data.length) {
+      parts.push(data);
+      const pad = (512 - (data.length % 512)) % 512;
+      if (pad) parts.push(Buffer.alloc(pad));
+    }
+  }
+  parts.push(Buffer.alloc(1024));       // end of archive
+  return zlib.gzipSync(Buffer.concat(parts));
+}
+
+const FAKE_TOR = 'fake tor 0.4.9.12\n' + 'x'.repeat(200000);   // spans many 512-byte blocks
+
+async function startDist({ version = '15.0.22', corrupt = false, noSums = false } = {}) {
+  const state = { hits: new Map(), name: bundle.artifactName(version) };
+  const gz = tarGz([
+    { name: 'tor/', type: '5', mode: 0o700 },
+    { name: 'tor/tor', data: FAKE_TOR, mode: 0o700 },
+    { name: 'tor/libevent-2.1.so.7', data: 'lib', mode: 0o700 },
+    { name: 'tor/pluggable_transports/lyrebird', data: 'pt', mode: 0o700 },
+    { name: 'data/geoip', data: 'geo', mode: 0o644 },
+    { name: 'data/geoip6', data: 'geo6', mode: 0o644 },
+    { name: 'debug/tor', data: Buffer.alloc(300000, 7), mode: 0o700 },
+  ]);
+  const digest = crypto.createHash('sha256').update(gz).digest('hex');
+  const sums = `${corrupt ? 'f'.repeat(64) : digest}  ${state.name}\n`;
+  const server = http.createServer((req, res) => {
+    const url = req.url.split('?')[0];
+    state.hits.set(url, (state.hits.get(url) || 0) + 1);
+    if (url === '/torbrowser/') {
+      res.writeHead(200, { 'content-type': 'text/html' });
+      return res.end('<a href="16.0a11/">a</a>\n<a href="14.0.9/">b</a>\n<a href="15.0.22/">c</a>\n');
+    }
+    if (url === `/torbrowser/${version}/${bundle.SUMS}`) {
+      if (noSums) { res.writeHead(404); return res.end('gone'); }
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      return res.end(sums);
+    }
+    if (url === `/torbrowser/${version}/${state.name}`) {
+      res.writeHead(200, { 'content-length': String(gz.length) });
+      return res.end(gz);
+    }
+    res.writeHead(404);
+    res.end('nope');
+  });
+  const port = await listen(server);
+  return { port, state, gz, url: `http://127.0.0.1:${port}/torbrowser/`, close: () => server.close() };
 }
 
 /* ================================ tests ================================== */
@@ -432,7 +513,9 @@ async function startOrigin() {
 
   await test('exit check walks through the configured proxy (network)', async () => {
     pool.setConfig({ mode: 'tor', torSocks: `socks5://127.0.0.1:${socks.port}`, torControl: '' });
-    const out = await exitCheck(15000);
+    // the mock tunnels to the real check.torproject.org: a network hiccup is
+    // not a failure of this code, so a throw is the same as "no network"
+    const out = await exitCheck(15000).catch(() => ({ ip: '' }));
     if (!out.ip) return console.log('      (skipped: no external network)');
     assert.ok(pool.status().stats.lastExit.ip, 'exit IP was not recorded');
     assert.ok(pool.status().stats.exitsSeen >= 1);
@@ -656,6 +739,151 @@ async function startOrigin() {
     assert.strictEqual(route.suggest, null);
     assert.ok(/install Tor|start Tor|route to direct/.test(route.hint), `unhelpful hint: ${route.hint}`);
     pool.setConfig({ mode: 'off' });
+  });
+
+  /* ------------------------- Tor bundle provisioning ----------------------- */
+
+  await test('the release listing picks the newest stable Tor, not an alpha', () => {
+    assert.strictEqual(bundle.pickVersion('<a href="16.0a11/">x</a><a href="14.5.9/">y</a><a href="15.0.22/">z</a>'), '15.0.22');
+    assert.strictEqual(bundle.pickVersion('nothing here'), '');
+  });
+
+  await test('the bundle name matches this platform, and unsupported ones say so', () => {
+    const name = bundle.artifactName('15.0.22');
+    if (process.platform === 'linux' && process.arch === 'x64') {
+      assert.strictEqual(name, 'tor-expert-bundle-linux-x86_64-15.0.22.tar.gz');
+      assert.strictEqual(bundle.supported(), true);
+    }
+    assert.ok(name === '' || /^tor-expert-bundle-[a-z0-9_-]+-15\.0\.22\.tar\.gz$/.test(name), name);
+    assert.strictEqual(bundle.supported(), name !== '');
+    if (!name) assert.match(bundle.unsupportedReason(), /install Tor/i);
+  });
+
+  await test('the published sha256 file is parsed (checksum column + filename)', () => {
+    const text = `aaaa  other.tar.gz\n${'b'.repeat(64)}  *tor-expert-bundle-linux-x86_64-15.0.22.tar.gz\n`;
+    assert.strictEqual(bundle.parseSums(text, 'tor-expert-bundle-linux-x86_64-15.0.22.tar.gz'), 'b'.repeat(64));
+    assert.strictEqual(bundle.parseSums(text, 'missing.tar.gz'), '');
+  });
+
+  await test('the tar extractor unpacks only Tor + geoip, byte for byte', async () => {
+    const files = await bundle.extractTarGz(tarGz([
+      { name: 'tor/', type: '5' },
+      { name: 'tor/tor', data: FAKE_TOR },
+      { name: 'data/geoip', data: 'geo' },
+      { name: 'data/geoip6', data: 'geo6' },
+      { name: 'debug/tor', data: Buffer.alloc(300000, 7) },
+      { name: 'docs/tor.txt', data: 'docs' },
+    ]), { keep: bundle.KEEP, skip: bundle.SKIP });
+    assert.deepStrictEqual([...files.keys()].sort(), ['data/geoip', 'tor/tor']);
+    assert.strictEqual(files.get('tor/tor').data.length, FAKE_TOR.length, 'a large entry was truncated');
+    assert.strictEqual(files.get('tor/tor').data.toString('utf8'), FAKE_TOR, 'entry content was corrupted');
+    assert.strictEqual(files.get('data/geoip').data.toString('utf8'), 'geo');
+    assert.ok(!files.has('debug/tor'), 'debug symbols must not be kept');
+    assert.ok(!files.has('data/geoip6'), 'the IPv6 geoip table is ~16 MB and unused here');
+    assert.ok(![...files.keys()].some(k => k.includes('pluggable_transports')), 'bridge transports are ~30 MB and unused here');
+  });
+
+  await test('install() downloads, verifies and unpacks a runnable tor', async () => {
+    if (!bundle.supported()) return console.log('      (skipped: no official bundle for this platform)');
+    const dist = await startDist();
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'snipr-bundle-'));
+    const phases = [];
+    const out = await bundle.install({ dir, base: dist.url, onProgress: p => phases.push(p.phase) });
+    assert.strictEqual(out.ok, true);
+    assert.strictEqual(out.version, '15.0.22', 'the version from the listing was not used');
+    assert.strictEqual(out.verified, true);
+    assert.strictEqual((fs.statSync(out.bin).mode & 0o777), 0o755, 'the tor binary is not executable');
+    assert.strictEqual(fs.readFileSync(out.bin, 'utf8'), FAKE_TOR, 'the tor binary is not the downloaded one');
+    assert.ok(fs.existsSync(path.join(out.dir, 'data', 'geoip')), 'geoip was not unpacked');
+    assert.ok(!fs.existsSync(path.join(out.dir, 'debug')), 'debug symbols were unpacked');
+    assert.ok(!fs.existsSync(path.join(out.dir, 'tor', 'pluggable_transports')), 'the whole bundle was unpacked, not just the daemon');
+    assert.ok(phases.includes('downloading') && phases.includes('verifying') && phases.includes('extracting'),
+      `phases: ${phases.join(',')}`);
+
+    const downloads = dist.state.hits.get(`/torbrowser/15.0.22/${dist.state.name}`);
+    assert.ok(downloads >= 1, 'the bundle was not requested from its release directory');
+    const again = await bundle.install({ dir, base: dist.url });
+    assert.strictEqual(again.cached, true, 'a second install must reuse the cache');
+    assert.strictEqual(dist.state.hits.get(`/torbrowser/15.0.22/${dist.state.name}`), downloads, 'the bundle was downloaded twice');
+
+    const found = bundle.findInstalled({ dir });
+    assert.ok(found && found.version === '15.0.22' && found.bin === out.bin, 'findInstalled() did not see the install');
+
+    dist.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  await test('install() refuses a bundle whose sha256 does not match, and leaves nothing behind', async () => {
+    if (!bundle.supported()) return console.log('      (skipped: no official bundle for this platform)');
+    const dist = await startDist({ corrupt: true });
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'snipr-bundle-bad-'));
+    await assert.rejects(() => bundle.install({ dir, base: dist.url }), /SHA-256/);
+    assert.strictEqual(fs.existsSync(path.join(dir, '15.0.22', 'tor', 'tor')), false,
+      'an unverified tor binary was left on disk');
+    dist.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  await test('install() proceeds without a published checksum but says so', async () => {
+    if (!bundle.supported()) return console.log('      (skipped: no official bundle for this platform)');
+    const dist = await startDist({ noSums: true });
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'snipr-bundle-nosums-'));
+    const warns = [];
+    const out = await bundle.install({ dir, base: dist.url, onProgress: p => { if (p.warning) warns.push(p.warning); } });
+    assert.strictEqual(out.verified, false);
+    assert.ok(warns.length, 'an unverified download must warn');
+    dist.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  await test('ensureBinary() reuses a cached bundle, and explains itself when downloads are off', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'snipr-ensure-'));
+    const prev = process.env.SNIPR_TOR_HOME;
+    process.env.SNIPR_TOR_HOME = dir;
+    try {
+      const noDownload = await torLayer.ensureBinary({ allowDownload: false });
+      const system = torLayer.findSystemBinary();
+      if (system) {
+        assert.strictEqual(noDownload.ok, true, 'a system tor must be preferred over anything else');
+        assert.strictEqual(noDownload.source, 'system');
+      } else {
+        assert.strictEqual(noDownload.ok, false, 'no tor anywhere must not report success');
+        assert.match(noDownload.error, /no tor binary|no official build/i);
+      }
+
+      // a bundle in the cache is picked up without touching the network
+      fs.mkdirSync(path.join(dir, '15.0.22', 'tor'), { recursive: true });
+      const bin = path.join(dir, '15.0.22', 'tor', 'tor');
+      fs.writeFileSync(bin, '#!/bin/sh\n', { mode: 0o755 });
+      const cached = await torLayer.ensureBinary({ allowDownload: false });
+      assert.strictEqual(cached.source, system ? 'system' : 'cache');
+      assert.strictEqual(torLayer.findManagedBinary().bin, bin);
+      assert.strictEqual(torLayer.status().installed, true, 'a cached bundle must count as installed');
+    } finally {
+      if (prev === undefined) delete process.env.SNIPR_TOR_HOME; else process.env.SNIPR_TOR_HOME = prev;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  await test('the managed torrc points tor at its bundled geoip files', () => {
+    const torrc = torLayer.torrcFor({
+      socksPort: 9050, controlPort: 0, hash: '', dataDir: '/tmp/x',
+      geoip: '/opt/tor/15.0.22/data/geoip', geoip6: '/opt/tor/15.0.22/data/geoip6',
+    });
+    assert.match(torrc, /^GeoIPFile \/opt\/tor\/15\.0\.22\/data\/geoip$/m);
+    assert.match(torrc, /^GeoIPv6File \/opt\/tor\/15\.0\.22\/data\/geoip6$/m);
+    assert.ok(!/GeoIPFile/.test(torLayer.torrcFor({ socksPort: 9050, dataDir: '/tmp/x' })),
+      'no geoip paths must mean no geoip lines');
+  });
+
+  await test('status() and the route hint expose what a start will need to do', () => {
+    const t = torLayer.status();
+    assert.strictEqual(typeof t.canInstall, 'boolean');
+    assert.ok('install' in t, 'status() must carry the install/daemon progress');
+    const daemon = pool.status().tor.daemon;
+    assert.strictEqual(daemon.canInstall, t.canInstall, 'proxy status must relay canInstall');
+    assert.ok('install' in daemon, 'proxy status must relay install progress');
+    assert.match(torLayer.installHint(), /start Tor/i, torLayer.installHint());
   });
 
   made.push(origin, socks, socksAuth, httpProxy, httpProxy2, control, controlPw);

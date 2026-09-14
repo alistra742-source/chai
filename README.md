@@ -111,6 +111,9 @@ The layer is implemented in `lib/proxy.js`: a real SOCKS5 client (greeting,
 user/pass auth, CONNECT), HTTP proxies via `CONNECT`, per-request agents, and
 the Tor control protocol. `lib/http.js` is a small `fetch`-alike used by every
 checker, so **server, browser-relayed and swarm** checks all go through it.
+`lib/tor.js` runs and stops a Tor daemon for you, and `lib/torbundle.js` fetches
+the official Tor binaries when the host has none — so Tor mode needs no torrc,
+no control password and no `apt-get install` from you.
 
 `lib/http.js` also owns the things these sites need to answer at all:
 
@@ -198,10 +201,42 @@ Tor` kills it and removes its DataDirectory.
 |---|---|
 | a Tor is already listening (e.g. **Tor Browser**, 9150) | adopts it as-is — no control password for someone else's daemon, so rotation is per-request circuit isolation |
 | a `tor` binary exists, nothing listening | `▶ start Tor` runs one on 9050/9051 (or the next free port) and switches the route to it in one click |
-| no `tor` binary | the button is disabled and the line names the install (`apt-get install tor` · `brew install tor`) plus the two routes that need no Tor: a **proxy list**, or **direct** |
+| **no `tor` binary (a container)** | `▶ start Tor` fetches the official **Tor Expert Bundle**, verifies it and runs **that** — one click, no shell, nothing installed system-wide (below) |
+
+#### `▶ start Tor` with no Tor on the host
+
+`lib/torbundle.js` removes the last manual step. On a host with no `tor` binary
+(Fresh container? No package lists? No shell?) the button:
+
+1. reads `dist.torproject.org/torbrowser/` and picks the newest **stable** release
+   (alphas such as `16.0a11` have no expert bundle);
+2. downloads `tor-expert-bundle-linux-x86_64-<version>.tar.gz` (~32 MB) with live
+   progress, and pulls `sha256sums-signed-build.txt` from the same release folder;
+3. **refuses to run the download unless the SHA-256 matches** the published one;
+4. unpacks it — with a streaming tar reader over `zlib`, so the `tar` binary is
+   not needed either — keeping only the daemon, its shared libraries and the
+   geoip table (the bundle's debug symbols, docs and bridge transports are ~50 MB
+   of dead weight, so the cache ends up ~20 MB);
+5. runs it exactly like a system tor, with `LD_LIBRARY_PATH` pointing at its
+   bundled libevent/OpenSSL, and switches the route to it.
+
+Progress is shown live in section 4 (`downloading Tor 15.0.22 — 42% (13.5 MB of
+32.3 MB)`, `verifying the Tor download (SHA-256)…`, `bootstrapping into the
+network — 45%`), because a first start takes ~30–60 s. The bundle is kept under
+`~/.snipr/tor/<version>/` (override with `SNIPR_TOR_HOME`), so every later start
+is instant, and it is never installed system-wide: nothing is written outside
+that cache, and deleting the directory removes it completely.
+
+Automatic setup covers Linux x86_64 and macOS (x86_64/arm64), the platforms the
+Tor Project publishes expert bundles for; elsewhere the line says so and falls
+back to `apt-get install tor` / `brew install tor` or a proxy list. The download
+is an HTTPS fetch from `dist.torproject.org` checked against the checksum
+published next to it — the same trust model as the Tor Browser updater, not a
+GPG signature check.
 
 The daemon is a child of this app and is killed when the app exits, so a preview
-restart never leaves an orphan holding 9050. Nothing is ever installed for you.
+restart never leaves an orphan holding 9050. If the download fails, the button
+reports why and Tor mode stays off — no half-installed state is left behind.
 `TOR_DISCOVER_PORTS` (default `9050,9150`) lists the ports probed for an existing
 daemon.
 
@@ -222,6 +257,8 @@ Environment defaults (the dashboard can change all of it at runtime):
 | `TOR_SOCKS` | Tor SOCKS5 address, default `socks5://127.0.0.1:9050` |
 | `TOR_CONTROL` | Tor control address, default `127.0.0.1:9051` |
 | `TOR_CONTROL_PASSWORD` | password for the control port (omit to clear) |
+| `SNIPR_TOR_HOME` | where a fetched Tor bundle is cached (default `~/.snipr/tor`) |
+| `SNIPR_TOR_MIRROR` | base URL for the Tor release listing/download (default `https://dist.torproject.org/torbrowser/`) |
 
 **Test exit IP** on the dashboard runs a real request through the current route
 to `check.torproject.org` and shows the exit IP plus whether it really is a Tor
@@ -249,19 +286,25 @@ keeps showing requests routed, new identities issued and exits seen.
   exit we tried"*, which means all of the route's exits are flagged. The run
   stops after 12 in a row instead of grinding on — nothing is silently scored as
   `taken`.
-- **Tor mode needs a Tor daemon on the same machine as this app.** Where you can
-  run one, `▶ start Tor` starts and manages it for you (above). Where you cannot
-  — the Freebuff sandbox and most hosting containers ship no `tor` binary and no
-  package list — you now get that answer *on apply route* (`no tor binary on this
-  host …`, with the install command) instead of a wordlist of `network error`s.
-  There, use a **proxy list** (`socks5://…` / `http://…`, e.g. a residential
-  proxy provider) or leave the route **off**, and run Tor locally for circuits.
+- **Tor mode needs a Tor daemon on the same machine as this app** — and
+  `▶ start Tor` now supplies one itself, downloading the official bundle when the
+  host has no `tor` binary (above). You therefore no longer need a shell, a
+  package manager or a locally installed Tor to use Tor mode.
+- **Tor exits are still Tor exits, and guns.lol knows.** A rotation changes the
+  IP, it does not make a Tor exit look residential: real sweeps through the
+  fetched bundle produce `kind: blocked` (`guns.lol rejected every exit we tried
+  (HTTP 403)`) and the run stops after 12 in a row. Where a target rejects Tor
+  wholesale, use a **proxy list** (`socks5://…` / `http://…`, e.g. a residential
+  proxy provider) or leave the route **off**.
 
 Every one of the behaviours above is covered — cookie replay, one exit per
 redirect chain, cookies dropped on a Tor rotation, 401 retried only when the
-route can rotate, rejected exits skipped, identity/route health, Tor discovery
-and the generated torrc. Run the proxy test suite (mock SOCKS5 server, mock
-CONNECT proxy, mock Tor control port, real HTTPS through the tunnel):
+route can rotate, rejected exits skipped, identity/route health, Tor discovery,
+the generated torrc, and the whole Tor bundle path (release listing, platform
+artifact name, checksum parsing and mismatch rejection, tar extraction against a
+mock Tor Project server, cache reuse, install progress). Run the proxy test
+suite (mock SOCKS5 server, mock CONNECT proxy, mock Tor control port, real HTTPS
+through the tunnel):
 
 ```bash
 npm test        # node test/net.test.js
@@ -291,7 +334,7 @@ never repeats, never materialises the space in memory, so *left to check* stays 
 | `GET /api/swarm` | real browser detected? playwright available? swarm running? per-browser stats |
 | `GET /api/net` | current rotating-exit config + live stats (requests routed, rotations, exits seen, errors) + Tor daemon/binary state |
 | `POST /api/net` | `{mode: off\|tor\|list, torSocks, torControl, torPassword, isolate, rotateEvery, rotateIntervalMs, list, discoverPorts}` |
-| `POST /api/net/tor` | `{action: start\|stop\|status}` — start a **managed local Tor** (generated torrc, `IsolateSOCKSAuth`, random control password) and switch the route to it, or stop the one this app started; with no `tor` binary it returns the install command instead |
+| `POST /api/net/tor` | `{action: start\|stop\|status, install?}` — start a **managed local Tor** (generated torrc, `IsolateSOCKSAuth`, random control password) and switch the route to it, or stop the one this app started. A start with no `tor` on the host fetches and verifies the official Tor bundle first (`install: false` disables that); `status` is cheap and carries the install/daemon progress the dashboard polls while a start runs |
 | `POST /api/net/check` | probe the configured route → `{ok, error, results[]}` (TCP/SOCKS5 reachability, no traffic to the target) |
 | `POST /api/net/test` | one real request through the current route → `{ip, isTor, ms}` (proves the tunnel) |
 | `GET /api/cam/1.jpg…6.jpg` | live screenshot of browser N (swarm mode) |
