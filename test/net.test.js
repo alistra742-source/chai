@@ -20,6 +20,7 @@ const http = require('http');
 const assert = require('assert');
 
 const pool = require('../lib/proxy');
+const torLayer = require('../lib/tor');
 const { fetchWithTimeout, exitCheck } = require('../lib/http');
 const { liveCheck } = require('../lib/checkers');
 
@@ -33,6 +34,18 @@ async function test(name, fn) {
 
 function listen(server) {
   return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
+}
+
+/* A port nothing is listening on: used as a "this daemon is not up" address. */
+function deadPort() {
+  return new Promise((resolve, reject) => {
+    const srv = net.createServer();
+    srv.once('error', reject);
+    srv.listen(0, '127.0.0.1', () => {
+      const port = srv.address().port;
+      srv.close(() => resolve(port));      // closed again immediately: now refused
+    });
+  });
 }
 
 /* ------------------------------ mock SOCKS5 ------------------------------- */
@@ -148,7 +161,8 @@ async function startTorControl({ password = '', rejectAuth = false } = {}) {
         if (line.startsWith('AUTHENTICATE')) {
           const ok = !rejectAuth && (!password || line === `AUTHENTICATE "${password}"`);
           socket.write(ok ? '250 OK\r\n' : '515 Authentication failed: wrong password\r\n');
-        } else if (line.startsWith('SIGNAL NEWNYM')) socket.write('250 OK\r\n');
+        } else if (line.startsWith('PROTOCOLINFO')) socket.write('250-PROTOCOLINFO 1\r\n250 OK\r\n');
+        else if (line.startsWith('SIGNAL NEWNYM')) socket.write('250 OK\r\n');
         else if (line.startsWith('QUIT')) { socket.write('250 closing connection\r\n'); socket.end(); }
       }
     });
@@ -566,6 +580,82 @@ async function startOrigin() {
 
     pool.setConfig({ mode: 'off' });
     assert.strictEqual(pool.isBadExit(dead), false, 'changing route must clear the blocked exits');
+  });
+
+  /* --------------------------- managed local Tor --------------------------- */
+
+  await test('the managed torrc isolates circuits and never writes the password', () => {
+    const torrc = torLayer.torrcFor({
+      host: '127.0.0.1', socksPort: 9050, controlPort: 9051, hash: '16:ABC+/=', dataDir: '/tmp/snipr-tor-x',
+    });
+    assert.match(torrc, /^SocksPort 127\.0\.0\.1:9050 IsolateSOCKSAuth$/m, 'IsolateSOCKSAuth is what makes per-request circuits work');
+    assert.match(torrc, /^ControlPort 127\.0\.0\.1:9051$/m);
+    assert.match(torrc, /^HashedControlPassword 16:ABC\+\/=$/m);
+    assert.match(torrc, /^DataDirectory \/tmp\/snipr-tor-x$/m);
+    assert.ok(!/plaintext|secret/.test(torrc));
+
+    const headless = torLayer.torrcFor({ socksPort: 9050, controlPort: 0, hash: '', dataDir: '/tmp/x' });
+    assert.ok(!/ControlPort/.test(headless), 'a daemon with no control auth must not expose a control port');
+  });
+
+  await test('discover() finds the daemon that IS answering, and reports nothing when none is', async () => {
+    const absent = await deadPort();
+    const found = await torLayer.discover({
+      socksPorts: [absent, socks.port], controlPorts: [absent, control.port], timeout: 1500,
+    });
+    assert.strictEqual(found.ok, true, 'a listening SOCKS5 port was not discovered');
+    assert.strictEqual(found.socks, `socks5://127.0.0.1:${socks.port}`);
+    assert.strictEqual(found.control, `127.0.0.1:${control.port}`, 'the control port was not discovered');
+
+    const none = await torLayer.discover({ socksPorts: [absent], controlPorts: [absent], timeout: 600 });
+    assert.strictEqual(none.ok, false);
+    assert.strictEqual(none.socks, '');
+  });
+
+  await test('start() explains a missing tor binary instead of throwing', async () => {
+    const out = await torLayer.start({ bin: '/nonexistent/snipr-tor-test', timeoutMs: 3000 });
+    assert.strictEqual(out.ok, false);
+    assert.match(out.error, /no tor binary/, `unexpected error: ${out.error}`);
+    assert.strictEqual(torLayer.status().running, false);
+  });
+
+  await test('status() reports the daemon and whether tor is installed', () => {
+    const t = torLayer.status();
+    assert.strictEqual(typeof t.installed, 'boolean');
+    assert.strictEqual(typeof t.binary, t.installed ? 'string' : 'object');
+    assert.strictEqual(t.running, false);
+    const s = pool.status().tor;
+    assert.ok(s.daemon && typeof s.daemon.running === 'boolean', 'proxy status must carry the tor daemon state');
+    assert.ok(Array.isArray(s.discoverPorts) && s.discoverPorts.includes(9050));
+  });
+
+  await test('a dead Tor route points at the Tor daemon that IS answering', async () => {
+    const absent = await deadPort();
+    pool.setConfig({
+      mode: 'tor', torSocks: `socks5://127.0.0.1:${absent}`, torControl: '', isolate: true,
+      discoverPorts: [absent, socks.port],
+    });
+    const route = await pool.checkRoute();
+    assert.strictEqual(route.ok, false, 'a refused route must not report ok');
+    assert.match(route.error, /ECONNREFUSED|closed|no answer/);
+    assert.ok(route.suggest, 'no suggestion for the Tor that is listening on another port');
+    assert.strictEqual(route.suggest.torSocks, `socks5://127.0.0.1:${socks.port}`);
+    assert.match(route.hint, /does answer on/, `unhelpful hint: ${route.hint}`);
+    pool.setConfig({ mode: 'off' });
+  });
+
+  await test('with no Tor anywhere the hint names the install (or the direct route)', async () => {
+    const absent = await deadPort();
+    const absent2 = await deadPort();
+    pool.setConfig({
+      mode: 'tor', torSocks: `socks5://127.0.0.1:${absent}`, torControl: '', isolate: true,
+      discoverPorts: [absent2],
+    });
+    const route = await pool.checkRoute();
+    assert.strictEqual(route.ok, false);
+    assert.strictEqual(route.suggest, null);
+    assert.ok(/install Tor|start Tor|route to direct/.test(route.hint), `unhelpful hint: ${route.hint}`);
+    pool.setConfig({ mode: 'off' });
   });
 
   made.push(origin, socks, socksAuth, httpProxy, httpProxy2, control, controlPw);

@@ -158,9 +158,12 @@ checker, so **server, browser-relayed and swarm** checks all go through it.
   tagged, the checker reports `can't reach the proxy route (…)` with the OS
   error (`ECONNREFUSED 127.0.0.1:9050`), and:
 
-  - `POST /api/net` returns `route: {ok:false, error}` immediately after you
-    **apply route**, so the dashboard says `⚠ saved, but the route does not
-    answer: …`;
+  - `POST /api/net` returns `route: {ok:false, error, hint, suggest}` immediately
+    after you **apply route**, so the dashboard says `⚠ saved, but the route does
+    not answer: …` and then names the fix that actually applies: a daemon is
+    already answering on another port (`suggest.torSocks`, one click to adopt —
+    Tor Browser listens on **9150**, not 9050), or there is no Tor at all and the
+    `▶ start Tor` button is the way out (below);
   - `POST /api/start` **refuses to start** a run on an undiallable route;
   - if the route dies mid-run, the engine stops after 3 straight proxy failures
     instead of marking the whole wordlist as errors.
@@ -169,6 +172,38 @@ checker, so **server, browser-relayed and swarm** checks all go through it.
   connect to the proxy (plus the SOCKS5 greeting) and also warns when a Tor
   control port is unreachable — that alone does not stop rotation, it only
   disables `SIGNAL NEWNYM`.
+
+### Starting Tor from the dashboard (`▶ start Tor`)
+
+Section **4 · Exit IP** shows the daemon state and, in Tor mode, `▶ start Tor` /
+`■ stop Tor`. `lib/tor.js` starts and manages the daemon itself, from a generated
+torrc:
+
+```
+SocksPort 127.0.0.1:9050 IsolateSOCKSAuth
+ControlPort 127.0.0.1:9051
+HashedControlPassword 16:…        # minted by `tor --hash-password`, random
+CookieAuthentication 0
+DataDirectory <temp dir>
+ClientOnly 1
+AvoidDiskWrites 1
+Log notice stdout
+```
+
+so per-request circuit isolation **and** `SIGNAL NEWNYM` both work with no setup
+on your side (the plaintext control password never lands in the torrc). `■ stop
+Tor` kills it and removes its DataDirectory.
+
+| Situation | What the dashboard does |
+|---|---|
+| a Tor is already listening (e.g. **Tor Browser**, 9150) | adopts it as-is — no control password for someone else's daemon, so rotation is per-request circuit isolation |
+| a `tor` binary exists, nothing listening | `▶ start Tor` runs one on 9050/9051 (or the next free port) and switches the route to it in one click |
+| no `tor` binary | the button is disabled and the line names the install (`apt-get install tor` · `brew install tor`) plus the two routes that need no Tor: a **proxy list**, or **direct** |
+
+The daemon is a child of this app and is killed when the app exits, so a preview
+restart never leaves an orphan holding 9050. Nothing is ever installed for you.
+`TOR_DISCOVER_PORTS` (default `9050,9150`) lists the ports probed for an existing
+daemon.
 
 ```bash
 # torrc (or /etc/tor/torrc)
@@ -182,6 +217,7 @@ Environment defaults (the dashboard can change all of it at runtime):
 | Variable | Meaning |
 |---|---|
 | `SNIPR_PROXY` | `tor` \| `list` \| `off` (default `off`) |
+| `TOR_DISCOVER_PORTS` | ports probed for an already-running Tor daemon (default `9050,9150`) |
 | `SNIPR_PROXY_LIST` | comma/newline separated proxy list (implies `list`) |
 | `TOR_SOCKS` | Tor SOCKS5 address, default `socks5://127.0.0.1:9050` |
 | `TOR_CONTROL` | Tor control address, default `127.0.0.1:9051` |
@@ -213,18 +249,19 @@ keeps showing requests routed, new identities issued and exits seen.
   exit we tried"*, which means all of the route's exits are flagged. The run
   stops after 12 in a row instead of grinding on — nothing is silently scored as
   `taken`.
-- **Tor mode needs a Tor daemon on the same machine as this app.** The Freebuff
-  sandbox (and most hosting containers) has no `tor` binary and nothing on port
-  9050, so selecting 🧅 Tor there fails every request — which is exactly the
-  `network error` wall the route check now reports up front. Use a **proxy
-  list** (`socks5://…` / `http://…`, e.g. a residential proxy provider) or leave
-  the route **off** in the sandbox, and run Tor locally if you want circuits.
+- **Tor mode needs a Tor daemon on the same machine as this app.** Where you can
+  run one, `▶ start Tor` starts and manages it for you (above). Where you cannot
+  — the Freebuff sandbox and most hosting containers ship no `tor` binary and no
+  package list — you now get that answer *on apply route* (`no tor binary on this
+  host …`, with the install command) instead of a wordlist of `network error`s.
+  There, use a **proxy list** (`socks5://…` / `http://…`, e.g. a residential
+  proxy provider) or leave the route **off**, and run Tor locally for circuits.
 
 Every one of the behaviours above is covered — cookie replay, one exit per
 redirect chain, cookies dropped on a Tor rotation, 401 retried only when the
-route can rotate, rejected exits skipped, identity/route health. Run the proxy
-test suite (mock SOCKS5 server, mock CONNECT proxy, mock Tor control port, real
-HTTPS through the tunnel):
+route can rotate, rejected exits skipped, identity/route health, Tor discovery
+and the generated torrc. Run the proxy test suite (mock SOCKS5 server, mock
+CONNECT proxy, mock Tor control port, real HTTPS through the tunnel):
 
 ```bash
 npm test        # node test/net.test.js
@@ -252,8 +289,9 @@ never repeats, never materialises the space in memory, so *left to check* stays 
 |---|---|
 | `GET /api/state` | live counters + swarm mode/worker telemetry + feed |
 | `GET /api/swarm` | real browser detected? playwright available? swarm running? per-browser stats |
-| `GET /api/net` | current rotating-exit config + live stats (requests routed, rotations, exits seen, errors) |
-| `POST /api/net` | `{mode: off\|tor\|list, torSocks, torControl, torPassword, isolate, rotateEvery, rotateIntervalMs, list}` |
+| `GET /api/net` | current rotating-exit config + live stats (requests routed, rotations, exits seen, errors) + Tor daemon/binary state |
+| `POST /api/net` | `{mode: off\|tor\|list, torSocks, torControl, torPassword, isolate, rotateEvery, rotateIntervalMs, list, discoverPorts}` |
+| `POST /api/net/tor` | `{action: start\|stop\|status}` — start a **managed local Tor** (generated torrc, `IsolateSOCKSAuth`, random control password) and switch the route to it, or stop the one this app started; with no `tor` binary it returns the install command instead |
 | `POST /api/net/check` | probe the configured route → `{ok, error, results[]}` (TCP/SOCKS5 reachability, no traffic to the target) |
 | `POST /api/net/test` | one real request through the current route → `{ip, isTor, ms}` (proves the tunnel) |
 | `GET /api/cam/1.jpg…6.jpg` | live screenshot of browser N (swarm mode) |

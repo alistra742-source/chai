@@ -25,6 +25,7 @@ const path = require('path');
 const { liveCheck } = require('./lib/checkers');
 const { Swarm, bind, detectPlaywright, detectBrowser, swarm } = require('./lib/swarm');
 const proxyPool = require('./lib/proxy');
+const torLayer = require('./lib/tor');
 const { exitCheck } = require('./lib/http');
 const {
   describeTarget, totalFor, nameAt, makeOrder, PATTERN_PRESETS, mulberry32,
@@ -357,7 +358,8 @@ const server = http.createServer(async (req, res) => {
       if (!route.ok) {
         return json(res, 400, {
           ok: false,
-          error: `proxy route unreachable (${route.error}) — fix section 4 (is Tor running? is the proxy alive?) or set the route to direct`,
+          error: `proxy route unreachable (${route.error}) — fix section 4 (is Tor running? is the proxy alive?) or set the route to direct`
+            + (route.hint ? ` — ${route.hint}` : ''),
           route, proxy: proxyPool.status(),
         });
       }
@@ -493,12 +495,42 @@ const server = http.createServer(async (req, res) => {
 
     // --- rotating proxy layer (Tor circuits / proxy list) -------------------
     if (req.method === 'GET' && p === '/api/net') {
-      return json(res, 200, { ok: true, proxy: proxyPool.status() });
+      return json(res, 200, { ok: true, proxy: proxyPool.status(), tor: torLayer.status() });
     }
 
     if (req.method === 'POST' && p === '/api/net/check') {
       const route = await proxyPool.checkRoute();
-      return json(res, 200, { ok: route.ok, route, proxy: proxyPool.status() });
+      return json(res, 200, { ok: route.ok, route, proxy: proxyPool.status(), tor: torLayer.status() });
+    }
+
+    /* Start/stop a local Tor daemon (lib/tor.js). Nothing is installed here: if
+     * there is no `tor` binary the answer says so plus what to install. When a
+     * daemon does come up, the route is switched to it in the same call, so one
+     * click takes Tor mode from "route does not answer" to a working route. */
+    if (req.method === 'POST' && p === '/api/net/tor') {
+      const body = await readBody(req);
+      const action = String(body.action || 'status').toLowerCase();
+      try {
+        if (action === 'stop') {
+          const stopped = await torLayer.stop();
+          return json(res, 200, { ok: true, stopped, tor: torLayer.status(), proxy: proxyPool.status() });
+        }
+        if (action === 'start') {
+          const started = await torLayer.start({ socksPort: Number(body.socksPort) || undefined });
+          if (!started.ok) return json(res, 200, { ok: false, error: started.error, tor: torLayer.status(), proxy: proxyPool.status() });
+          const proxy = proxyPool.setConfig({
+            mode: 'tor',
+            torSocks: started.socks,
+            torControl: started.control || '',
+            torPassword: started.password || '',
+          });
+          const route = await proxyPool.checkRoute();
+          return json(res, 200, { ok: route.ok, started, route, tor: torLayer.status(), proxy });
+        }
+        return json(res, 200, { ok: true, tor: torLayer.status(), proxy: proxyPool.status() });
+      } catch (e) {
+        return json(res, 200, { ok: false, error: String(e.message || e).slice(0, 240), tor: torLayer.status(), proxy: proxyPool.status() });
+      }
     }
 
     if (req.method === 'POST' && p === '/api/net') {
@@ -506,9 +538,9 @@ const server = http.createServer(async (req, res) => {
       try {
         const proxy = proxyPool.setConfig(body);
         const route = await proxyPool.checkRoute();   // prove the new route dials
-        return json(res, 200, { ok: true, proxy, route });
+        return json(res, 200, { ok: true, proxy, route, tor: torLayer.status() });
       } catch (e) {
-        return json(res, 400, { ok: false, error: String(e.message || e), proxy: proxyPool.status() });
+        return json(res, 400, { ok: false, error: String(e.message || e), proxy: proxyPool.status(), tor: torLayer.status() });
       }
     }
 

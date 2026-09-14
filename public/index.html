@@ -122,6 +122,11 @@
         <input type="text" inputmode="numeric" id="rotInterval" value="10">
       </label>
     </div>
+    <div class="row tor-only">
+      <span id="torDaemon" class="muted small">🧅 Tor daemon: checking…</span>
+      <button id="torStart" title="run a local Tor daemon (needs the tor binary on this host)">▶ start Tor</button>
+      <button id="torStop" title="stop the Tor daemon this app started">■ stop Tor</button>
+    </div>
     <textarea id="proxyList" rows="3" spellcheck="false" hidden placeholder="one proxy per line:&#10;socks5://user:pass@127.0.0.1:1080&#10;http://user:pass@proxy.example:8080"></textarea>
     <div class="row">
       <button id="netApply">apply route</button>
@@ -129,6 +134,7 @@
       <span class="muted small" id="netStatus">direct — this machine's IP</span>
     </div>
     <p class="muted small" id="netHint"></p>
+    <p id="netSuggest" hidden></p>
 
     <div class="row actions">
       <button id="startBtn" class="primary">▶ START SNIPING</button>

@@ -134,7 +134,7 @@ function setNetStatus(text, cls) {
 
 function syncNetUI() {
   const mode = $('#proxyMode').value;
-  $$('label.tor-only').forEach(l => { l.hidden = mode !== 'tor'; });
+  $$('.tor-only').forEach(l => { l.hidden = mode !== 'tor'; });
   const pwLabel = $('#torPasswordChk').closest('label');
   const pwRow = $('#torPassword').closest('label');
   if (pwRow) pwRow.hidden = !(mode === 'tor' && $('#torPasswordChk').checked);
@@ -171,9 +171,101 @@ function netLabel(p) {
   return (p.mode === 'tor' ? '🧅 ' : '↻ ') + p.label + ' · ' + bits.join(' · ') + (err ? ' · ⚠ ' + err : '');
 }
 
+/* ---------------------- tor daemon (start/stop) -------------------------- */
+function renderTor(t) {
+  if (!t) return;
+  const el = $('#torDaemon');
+  if (!el) return;
+  const d = t.daemon || {};
+  let text, cls = '';
+  if (d.error && !d.running) { text = '🧅 Tor daemon: ' + d.error; cls = 'warn'; }
+  else if (d.running) {
+    const ctl = d.control
+      ? ` · control ${d.control}${d.hasPassword ? ' (app-managed)' : ''}`
+      : ' · no control port (circuit isolation only)';
+    text = `🧅 Tor daemon: running on ${d.socks}${ctl} · bootstrapped ${d.bootstrap}%${d.version ? ' · tor ' + d.version : ''}${d.reused ? ' · adopted' : ''}`;
+    cls = 'ok';
+  } else if (t.binary) text = `🧅 Tor daemon: not running — ${t.binary} is installed, press ▶ start Tor`;
+  else text = '🧅 Tor daemon: no tor binary on this host (apt-get install tor · brew install tor) and nothing answering on 9050/9150 — use a proxy list, or leave the route direct';
+  el.textContent = text;
+  el.className = 'muted small' + (cls ? ' ' + cls : '');
+  const start = $('#torStart');
+  const stop = $('#torStop');
+  if (start) start.disabled = !!d.running || !t.binary;
+  if (stop) stop.disabled = !d.running || !!d.reused;
+}
+
+async function torAction(action) {
+  const start = $('#torStart');
+  const stop = $('#torStop');
+  if (start) start.disabled = true;
+  if (stop) stop.disabled = true;
+  state.netToastUntil = Date.now() + 120000;   // bootstrapping can take a while: don't overwrite this line
+  setNetStatus(action === 'start' ? '🧅 starting a local Tor daemon (bootstrapping can take ~30s)…' : '🧅 stopping Tor…');
+  const j = await fetch('/api/net/tor', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ action }),
+  }).then(r => r.json()).catch(() => null);
+  state.netToastUntil = 0;
+  if (!j) { setNetStatus('⚠ server unreachable', 'warn'); return; }
+  renderTor(j.tor);
+  if (j.proxy) state.net = j.proxy;
+  if (action === 'start' && j.started && j.started.socks) {
+    $('#proxyMode').value = 'tor';
+    $('#torSocks').value = j.started.socks;
+    if (j.started.control) $('#torControl').value = j.started.control;
+    if (j.started.password) $('#torPasswordChk').checked = true;
+    syncNetUI();
+  }
+  if (!j.ok) {
+    state.netToastUntil = Date.now() + 20000;
+    setNetStatus('⚠ ' + (j.error || ('tor ' + action + ' failed')), 'warn');
+    return;
+  }
+  if (j.route && !j.route.ok) {
+    state.netToastUntil = Date.now() + 15000;
+    setNetStatus('⚠ Tor is up but the route still does not answer: ' + j.route.error, 'warn');
+    showSuggest(j.route);
+    return;
+  }
+  state.netToastUntil = Date.now() + 8000;
+  setNetStatus(action === 'start'
+    ? `🧅 ${j.started && j.started.reused ? 'using the Tor on' : 'started Tor on'} ${(j.started && j.started.socks) || '127.0.0.1:9050'} — route applied${j.started && j.started.note ? ' · ' + j.started.note : ''}`
+    : '🧅 Tor stopped — the route still points at it: start it again or set the route to direct',
+  action === 'start' ? 'ok' : 'warn');
+}
+
+/* A Tor route that cannot be dialled comes back with a hint and, when another
+ * Tor is already answering (Tor Browser on 9150), the address to switch to. */
+function showSuggest(route) {
+  const box = $('#netSuggest');
+  if (!box) return;
+  box.hidden = true;
+  box.textContent = '';
+  if (!route || !route.hint) return;
+  const span = document.createElement('span');
+  span.textContent = route.hint;
+  box.appendChild(span);
+  if (route.suggest && route.suggest.torSocks) {
+    const use = document.createElement('button');
+    use.textContent = 'use ' + route.suggest.torSocks;
+    use.addEventListener('click', async () => {
+      $('#proxyMode').value = 'tor';
+      $('#torSocks').value = route.suggest.torSocks;
+      if (route.suggest.torControl) $('#torControl').value = route.suggest.torControl;
+      syncNetUI();
+      box.hidden = true;
+      state.netToastUntil = 0;
+      await applyNet(false);
+    });
+    box.appendChild(use);
+  }
+  box.hidden = false;
+}
+
 function renderNet(p) {
   if (!p) return;
   state.net = p;
+  renderTor(p.tor);
   if (Date.now() < state.netToastUntil) return;
   setNetStatus(netLabel(p), p.mode === 'off' ? '' : 'tor');
   if (state.netFilled) return;
@@ -200,6 +292,7 @@ async function applyNet(silent) {
     method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(netBody()),
   }).then(r => r.json()).catch(() => null);
   if (!j) { setNetStatus('⚠ server unreachable', 'warn'); return false; }
+  if (j.tor) renderTor(j.tor);
   if (!j.ok) {
     state.netToastUntil = Date.now() + 6000;
     setNetStatus('⚠ ' + j.error, 'warn');
@@ -209,10 +302,12 @@ async function applyNet(silent) {
   // a route that saves but cannot be dialled is the #1 cause of "every name is
   // a network error", so say it right here instead of letting a run discover it
   if (j.route && !j.route.ok) {
-    state.netToastUntil = Date.now() + 8000;
+    state.netToastUntil = Date.now() + 15000;
     setNetStatus('⚠ saved, but the route does not answer: ' + j.route.error, 'warn');
+    showSuggest(j.route);      // "press ▶ start Tor" / "a Tor does answer on 127.0.0.1:9150"
     return true;
   }
+  showSuggest(null);
   if (j.route && j.route.warnings && j.route.warnings.length) {
     state.netToastUntil = Date.now() + 8000;
     setNetStatus('⚠ ' + j.route.warnings[0], 'warn');
@@ -238,6 +333,8 @@ $('#torPasswordChk').addEventListener('change', syncNetUI);
 $('#rotEvery').addEventListener('input', () => { $('#rotEveryVal').textContent = $('#rotEvery').value; });
 $('#netApply').addEventListener('click', () => applyNet(false));
 $('#netTest').addEventListener('click', testNet);
+$('#torStart').addEventListener('click', () => torAction('start'));
+$('#torStop').addEventListener('click', () => torAction('stop'));
 
 function updateStartHint() {
   const t = currentTarget();
