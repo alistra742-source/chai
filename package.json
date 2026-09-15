@@ -1,12 +1,12 @@
 {
   "name": "snipr",
-  "version": "1.1.0",
+  "version": "2.0.0",
   "private": true,
-  "description": "Multi-platform username sniper (guns.lol / Discord / Instagram / TikTok) with 6-browser swarm + live cam wall",
+  "description": "Real-browser sniper console — six live-cam Chromium browsers walking the sniper-site flow (Names → pattern → Randomize → Sniper tab → Start) and reporting the name the site actually sniped",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node test/net.test.js"
+    "test": "node test/siteflow.test.js && node test/server.test.js"
   },
   "engines": {
     "node": ">=18"

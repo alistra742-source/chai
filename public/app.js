@@ -1,888 +1,489 @@
 'use strict';
-/* SNIPR frontend — dashboard, live cam wall, HYDRA swarm runtime.
- *
- * There is no simulation anywhere: every result comes from a real request.
- *
- * HYDRA: when the "swarm" engine is picked but the host has no real browser
- * to drive, the run falls back to 6 parallel Web Workers inside THIS browser
- * (your real browser, your real IP). Discord is checked directly (Pomelo
- * endpoint allows CORS); other platforms are relayed through /api/proxy.
- * The server hands out every name exactly once, so the six workers never
- * duplicate work.
+/*
+ * SNIPR dashboard — talks to the local server, renders the flow, the snipes and
+ * the six live cams. No frameworks, no build step: the server is the source of
+ * truth and this file only draws what /api/state reports.
  */
 
-const $ = (s) => document.querySelector(s);
-const $$ = (s) => [...document.querySelectorAll(s)];
-const fmt = (n) => Number(n || 0).toLocaleString('en-US');
-const N_BROWSERS = 6;
+const $ = id => document.getElementById(id);
+const ICONS = { discord: '🎮', gunslol: '🔫' };
 
-const PLATFORM_URL = {
-  gunslol: (u) => `https://guns.lol/${u}`,
-  instagram: (u) => `https://instagram.com/${u}`,
-  tiktok: (u) => `https://tiktok.com/@${u}`,
-  discord: () => null,
+const ui = {
+  platform: 'discord',
+  pattern: '4C',
+  patterns: [],
+  flows: [],
+  lastSnipesKey: '',
+  firstState: true,
 };
 
-const state = {
-  platform: 'gunslol',
-  tab: 'pattern',
-  feedFilter: 'all',
-  pollTimer: null,
-  lastRunId: null,
-  feedRenderedKey: '',
-  browserAbort: false,
-  pumping: false,
-  hydraRunning: false,
-  hydraWorkers: [],
-  lastCfg: null,          // config of the run in flight (hydra fallback)
-  swarmMode: null,        // 'playwright' | 'hydra' | null
-  camAt: [0, 0, 0, 0, 0, 0],
-  cams: {},               // workerId -> telemetry {current,checked,valid,last}
-  net: null,              // last proxy status from the server
-  torBusy: false,         // a start/stop is in flight (button stays disabled)
-  netFilled: false,       // controls seeded from the server once
-  netToastUntil: 0,       // keep a test/apply result on screen briefly
-};
+const fmt = n => (n == null ? '—' : Number(n).toLocaleString('en-US'));
+const clock = t => new Date(t).toLocaleTimeString('en-US', { hour12: false });
 
-/* ------------------------------ config UI ------------------------------- */
-$$('.platform').forEach(btn => btn.addEventListener('click', () => {
-  $$('.platform').forEach(b => b.classList.remove('active'));
-  btn.classList.add('active');
-  state.platform = btn.dataset.platform;
-  updateEngineNote();
-}));
-
-$$('.tab[data-tab]').forEach(btn => btn.addEventListener('click', () => {
-  $$('.tab[data-tab]').forEach(b => b.classList.remove('active'));
-  btn.classList.add('active');
-  state.tab = btn.dataset.tab;
-  $('#tab-pattern').hidden = state.tab !== 'pattern';
-  $('#tab-list').hidden = state.tab !== 'list';
-  updateStartHint();
-}));
-
-$$('.chip').forEach(btn => btn.addEventListener('click', () => {
-  $('#lenRange').value = btn.dataset.len;
-  $('#lenVal').textContent = btn.dataset.len;
-  $('#useLetters').checked = btn.dataset.charset === 'L' || btn.dataset.charset === 'C';
-  $('#useDigits').checked = btn.dataset.charset === 'C' || btn.dataset.charset === 'D';
-  syncPatternUI();
-}));
-
-$('#lenRange').addEventListener('input', () => syncPatternUI());
-$('#useLetters').addEventListener('change', syncPatternUI);
-$('#useDigits').addEventListener('change', syncPatternUI);
-
-function customSpec() {
-  const letters = $('#useLetters').checked, digits = $('#useDigits').checked;
-  const len = Number($('#lenRange').value);
-  const base = (letters ? 26 : 0) + (digits ? 10 : 0);
-  const charset = letters && digits ? 'C' : digits ? 'D' : 'L';
-  return { len, charset, base, count: base > 0 ? Math.pow(base, len) : 0 };
+function el(tag, className, text) {
+  const n = document.createElement(tag);
+  if (className) n.className = className;
+  if (text != null) n.textContent = text;
+  return n;
 }
 
-function syncPatternUI() {
-  const c = customSpec();
-  $('#lenVal').textContent = c.len;
-  $('#customCount').textContent = c.base > 0
-    ? `${c.base}^${c.len} = ${fmt(c.count)} possibilities`
-    : 'select at least one charset';
-  $$('.chip').forEach(b => b.classList.toggle('active',
-    Number(b.dataset.len) === c.len && b.dataset.charset === c.charset));
-  updateStartHint();
+function flow() {
+  return ui.flows.find(f => f.id === ui.platform) || ui.flows[0] || { id: 'discord', label: 'Discord', site: 'https://usersniper.com', siteLabel: 'usersniper.com' };
 }
 
-$('#concurrency').addEventListener('input', () => { $('#concVal').textContent = $('#concurrency').value; });
-$('#delay').addEventListener('input', () => { $('#delayVal').textContent = $('#delay').value + 'ms'; });
+/* ------------------------------- build ---------------------------------- */
 
-$('#nameList').addEventListener('input', () => {
-  const n = listNames().length;
-  $('#listCount').textContent = `${fmt(n)} username${n === 1 ? '' : 's'}`;
-  updateStartHint();
-});
-
-function listNames() {
-  return [...new Set($('#nameList').value.split(/[\s,;]+/).map(s => s.trim().toLowerCase()).filter(Boolean))];
-}
-
-const ENGINE_NOTES = {
-  server: 'Real checkers (ported from GitHub tools) fired from the machine hosting this app. Needs open outbound internet from that host.',
-  browser: 'Checks run from YOUR browser: Discord directly (CORS-enabled Pomelo endpoint); guns.lol / IG / TikTok relayed via /api/proxy on the server.',
-  swarm: '⚡ 6 REAL browsers sniping at the same time on the host, each with a live screenshot cam. Uses the Google Chrome / Edge already installed (or playwright\'s chromium via `npm i playwright`). If the host has no real browser, the run falls back to HYDRA: 6 real checkers inside YOUR browser.',
-};
-function updateEngineNote() { $('#engineNote').textContent = ENGINE_NOTES[$('#engine').value] || ''; }
-$('#engine').addEventListener('change', updateEngineNote);
-
-function currentTarget() {
-  if (state.tab === 'pattern') {
-    const c = customSpec();
-    return c.base > 0 ? { kind: 'pattern', len: c.len, charset: c.charset } : null;
+function buildPlatforms() {
+  const box = $('platforms');
+  box.innerHTML = '';
+  for (const f of ui.flows) {
+    const b = el('button', 'platform');
+    b.type = 'button';
+    b.dataset.id = f.id;
+    b.style.setProperty('--accent', f.accent || '#c9ff3d');
+    b.setAttribute('aria-pressed', String(f.id === ui.platform));
+    b.appendChild(el('span', 'ic', ICONS[f.id] || '◎'));
+    b.appendChild(el('span', 'nm', f.label));
+    b.appendChild(el('span', 'sub', `${f.siteLabel} · ${f.sniperTab || ''}`));
+    b.addEventListener('click', () => selectPlatform(f.id));
+    box.appendChild(b);
   }
-  return { kind: 'list', names: listNames() };
 }
 
-/* ---------------------- exit IP / Tor rotation --------------------------- */
-const NET_NOTES = {
-  off: 'Direct — every check leaves from the IP of the machine running this app.',
-  tor: '🧅 Tor: checks are tunnelled through the Tor SOCKS5 port. Every request opens a fresh circuit (unique SOCKS5 credentials + Tor\'s IsolateSOCKSAuth), and every N requests a SIGNAL NEWNYM forces a brand-new exit node. Needs a local Tor with `SocksPort 9050 IsolateSOCKSAuth` and `ControlPort 9051`. Many platforms block Tor exits (expect errors on IG/TikTok) — a proxy list or your own IP works better there. Note: the browser/HYDRA engine checks Discord from YOUR browser, which no server-side proxy can route — use the server or swarm engine for full Tor coverage.',
-  list: 'Round-robin: each request uses the next proxy in the list (socks5:// or http://), so the exit IP changes request by request. Bad lines are rejected when you apply.',
-};
-function setNetStatus(text, cls) {
-  const el = $('#netStatus');
-  el.textContent = text;
-  el.className = 'muted small' + (cls ? ' ' + cls : '');
-}
-
-function syncNetUI() {
-  const mode = $('#proxyMode').value;
-  $$('.tor-only').forEach(l => { l.hidden = mode !== 'tor'; });
-  const pwLabel = $('#torPasswordChk').closest('label');
-  const pwRow = $('#torPassword').closest('label');
-  if (pwRow) pwRow.hidden = !(mode === 'tor' && $('#torPasswordChk').checked);
-  if (pwLabel) pwLabel.hidden = mode !== 'tor';
-  $('#proxyList').hidden = mode !== 'list';
-  $('#netHint').textContent = NET_NOTES[mode] || '';
-}
-
-function netBody() {
-  const chk = $('#torPasswordChk').checked;
-  const pw = $('#torPassword').value;
-  const every = Number($('#rotEvery').value);
-  return {
-    mode: $('#proxyMode').value,
-    torSocks: $('#torSocks').value.trim(),
-    torControl: $('#torControl').value.trim(),
-    isolate: $('#torIsolate').checked,
-    rotateEvery: every,
-    rotateIntervalMs: Math.max(1000, (Number($('#rotInterval').value) || 10) * 1000),
-    list: $('#proxyList').value,
-    // never blank out a stored control password unless the box is unticked
-    ...(chk ? (pw ? { torPassword: pw } : {}) : { torPassword: '' }),
-  };
-}
-
-function netLabel(p) {
-  if (!p || p.mode === 'off') return 'direct — this machine\'s IP';
-  const s = p.stats || {};
-  const bits = [`${fmt(s.requests)} routed`];
-  if (s.rotations) bits.push(`${fmt(s.rotations)} × new identity`);
-  if (s.exitsSeen) bits.push(`${fmt(s.exitsSeen)} exit${s.exitsSeen === 1 ? '' : 's'} seen`);
-  if (s.lastExit && s.lastExit.ip) bits.push(`last exit ${s.lastExit.ip}${s.lastExit.isTor ? ' (Tor ✓)' : ''}`);
-  const err = s.errors && s.errors.length ? s.errors[s.errors.length - 1].msg : null;
-  return (p.mode === 'tor' ? '🧅 ' : '↻ ') + p.label + ' · ' + bits.join(' · ') + (err ? ' · ⚠ ' + err : '');
-}
-
-/* ---------------------- tor daemon (start/stop) -------------------------- */
-/* Two shapes reach this: proxyPool.status().tor = {binary, daemon:{…}} and the
- * flat torLayer.status() the /api/net/tor calls answer with. Normalise both. */
-function torState(t) {
-  if (!t) return null;
-  const d = t.daemon || t;
-  return {
-    binary: t.binary || d.binary || '',
-    canInstall: t.canInstall !== false && d.canInstall !== false,
-    install: d.install || t.install || null,
-    running: !!d.running,
-    reused: !!d.reused,
-    socks: d.socks || '',
-    control: d.control || '',
-    hasPassword: !!d.hasPassword,
-    bootstrap: Number(d.bootstrap) || 0,
-    version: d.version || '',
-    error: d.error || null,
-    source: d.source || '',
-  };
-}
-
-/* The one-line "what is it doing right now" for a start in flight. */
-function torProgress(d) {
-  if (!d) return '';
-  const i = d.install || {};
-  if (i.phase === 'failed' || i.phase === 'ready') return '';   // nothing in flight
-  const mb = (n) => (n / 1048576).toFixed(1) + ' MB';
-  if (i.phase === 'resolving') return 'looking up the current Tor release…';
-  if (i.phase === 'checksums') return `downloading Tor ${i.version} — fetching the published checksum…`;
-  if (i.phase === 'downloading') {
-    return i.total
-      ? `downloading Tor ${i.version} — ${i.pct}% (${mb(i.bytes)} of ${mb(i.total)})`
-      : `downloading Tor ${i.version} — ${mb(i.bytes || 0)}`;
-  }
-  if (i.phase === 'verifying') return `verifying the Tor download (SHA-256)…`;
-  if (i.phase === 'extracting') return `unpacking Tor ${i.version}…`;
-  if (d.running && d.bootstrap < 100) return `Tor is up, bootstrapping into the network — ${d.bootstrap}%`;
-  return '';
-}
-
-function renderTor(t, busy) {
-  const d = torState(t);
-  if (!d) return;
-  const el = $('#torDaemon');
-  if (!el) return;
-  let text, cls = '';
-  const progress = torProgress(d);
-  if (progress) { text = '🧅 ' + progress; cls = 'warn'; }
-  else if (d.error && !d.running) { text = '🧅 Tor: ' + d.error; cls = 'warn'; }
-  else if (d.running) {
-    const ctl = d.control
-      ? ` · control ${d.control}${d.hasPassword ? ' (app-managed)' : ''}`
-      : ' · no control port (circuit isolation only)';
-    text = `🧅 Tor: running on ${d.socks}${ctl} · bootstrapped ${d.bootstrap}%${d.version ? ' · tor ' + d.version : ''}${d.reused ? ' · adopted' : ''}`;
-    cls = 'ok';
-  } else if (d.binary) {
-    const cached = d.install && d.install.source && d.install.source !== 'system';
-    const ver = (d.install && d.install.version) ? ` ${d.install.version}` : '';
-    text = cached
-      ? `🧅 Tor:${ver} is ready (fetched earlier and cached) — press ▶ start Tor`
-      : `🧅 Tor: not running — ${d.binary} is installed, press ▶ start Tor`;
-  }
-  else if (!d.canInstall) text = '🧅 Tor: no tor binary on this host and no official build for this platform — install Tor yourself (apt-get install tor · brew install tor), or use a proxy list / the direct route';
-  else text = '🧅 Tor: no tor binary on this host — press ▶ start Tor and the app fetches the official Tor bundle once (~32 MB), then runs it';
-  el.textContent = text;
-  el.className = 'muted small' + (cls ? ' ' + cls : '');
-  const start = $('#torStart');
-  const stop = $('#torStop');
-  if (start) {
-    start.disabled = busy || d.running || !d.canInstall;
-    start.title = d.binary
-      ? 'run the Tor daemon on this host'
-      : 'download the official Tor bundle (~32 MB, once) and run it';
-  }
-  if (stop) stop.disabled = busy || !d.running || d.reused;
-  return d;
-}
-
-function postTor(payload) {
-  return fetch('/api/net/tor', {
-    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload),
-  }).then(r => r.json()).catch(() => null);
-}
-
-async function torAction(action) {
-  if (state.torBusy) return;
-  state.torBusy = true;
-  // a first start downloads Tor and bootstraps a circuit: a minute is normal,
-  // so poll the status while it runs instead of showing a frozen button
-  const poll = action === 'start'
-    ? setInterval(async () => {
-      const s = await postTor({ action: 'status' });
-      if (!s || !s.tor) return;
-      const d = renderTor(s.tor, true);
-      const line = torProgress(d);
-      if (line) setNetStatus('🧅 ' + line);
-    }, 1200)
-    : null;
-  renderTor(state.net ? state.net.tor : null, true);
-  state.netToastUntil = Date.now() + 600000;   // never overwrite this line mid-flight
-  setNetStatus(action === 'start' ? '🧅 starting Tor…' : '🧅 stopping Tor…');
-
-  const j = await postTor({ action });
-  if (poll) clearInterval(poll);
-  state.torBusy = false;
-  state.netToastUntil = 0;
-  if (!j) { renderTor(state.net && state.net.tor); setNetStatus('⚠ server unreachable', 'warn'); return; }
-  if (j.proxy) state.net = j.proxy;
-  renderTor(j.proxy ? j.proxy.tor : j.tor);
-  if (action === 'start' && j.started && j.started.socks) {
-    $('#proxyMode').value = 'tor';
-    $('#torSocks').value = j.started.socks;
-    if (j.started.control) $('#torControl').value = j.started.control;
-    if (j.started.password) $('#torPasswordChk').checked = true;
-    syncNetUI();
-  }
-  if (!j.ok) {
-    state.netToastUntil = Date.now() + 20000;
-    setNetStatus('⚠ ' + (j.error || ('tor ' + action + ' failed')), 'warn');
-    return;
-  }
-  if (j.route && !j.route.ok) {
-    state.netToastUntil = Date.now() + 15000;
-    setNetStatus('⚠ Tor is up but the route still does not answer: ' + j.route.error, 'warn');
-    showSuggest(j.route);
-    return;
-  }
-  const s = j.started || {};
-  const how = s.source === 'downloaded' ? 'fetched + started Tor'
-    : s.source === 'cache' ? 'started the Tor we fetched earlier'
-      : s.reused ? 'using the Tor on' : 'started Tor on';
-  state.netToastUntil = Date.now() + 8000;
-  setNetStatus(action === 'start'
-    ? `🧅 ${how} ${s.socks || '127.0.0.1:9050'} — route applied${s.note ? ' · ' + s.note : ''}`
-    : '🧅 Tor stopped — the route still points at it: start it again or set the route to direct',
-  action === 'start' ? 'ok' : 'warn');
-}
-
-/* A Tor route that cannot be dialled comes back with a hint and, when another
- * Tor is already answering (Tor Browser on 9150), the address to switch to. */
-function showSuggest(route) {
-  const box = $('#netSuggest');
-  if (!box) return;
-  box.hidden = true;
-  box.textContent = '';
-  if (!route || !route.hint) return;
-  const span = document.createElement('span');
-  span.textContent = route.hint;
-  box.appendChild(span);
-  if (route.suggest && route.suggest.torSocks) {
-    const use = document.createElement('button');
-    use.textContent = 'use ' + route.suggest.torSocks;
-    use.addEventListener('click', async () => {
-      $('#proxyMode').value = 'tor';
-      $('#torSocks').value = route.suggest.torSocks;
-      if (route.suggest.torControl) $('#torControl').value = route.suggest.torControl;
-      syncNetUI();
-      box.hidden = true;
-      state.netToastUntil = 0;
-      await applyNet(false);
+function buildPatterns() {
+  const box = $('patterns');
+  box.innerHTML = '';
+  for (const p of ui.patterns) {
+    const b = el('button', 'pat');
+    b.type = 'button';
+    b.dataset.id = p.id;
+    b.setAttribute('aria-pressed', String(p.id === ui.pattern));
+    b.appendChild(el('b', null, p.id));
+    b.appendChild(el('i', null, `${p.label} · ${fmt(p.total)}`));
+    b.addEventListener('click', () => {
+      ui.pattern = p.id;
+      $('patternCustom').value = '';
+      syncPattern();
     });
-    box.appendChild(use);
+    box.appendChild(b);
   }
-  box.hidden = false;
 }
 
-function renderNet(p) {
-  if (!p) return;
-  state.net = p;
-  // while a start/install is in flight the state poll must not re-enable the
-  // button underneath it
-  renderTor(p.tor, state.torBusy);
-  if (Date.now() < state.netToastUntil) return;
-  setNetStatus(netLabel(p), p.mode === 'off' ? '' : 'tor');
-  if (state.netFilled) return;
-  state.netFilled = true;
-  $('#proxyMode').value = p.mode;
-  if (p.tor.socks) $('#torSocks').value = p.tor.socks;
-  if (p.tor.control) $('#torControl').value = p.tor.control;
-  $('#torIsolate').checked = p.tor.isolate !== false;
-  $('#torPasswordChk').checked = !!p.tor.hasPassword;
-  $('#rotEvery').value = String(p.rotateEvery);
-  $('#rotEveryVal').textContent = String(p.rotateEvery);
-  $('#rotInterval').value = String(Math.round(p.rotateIntervalMs / 1000));
-  if (p.list.length) $('#proxyList').value = p.list.map(x => x.label).join('\n');
-  syncNetUI();
+function syncPattern() {
+  for (const b of document.querySelectorAll('.pat')) b.setAttribute('aria-pressed', String(b.dataset.id === ui.pattern));
+  const p = ui.patterns.find(x => x.id === ui.pattern);
+  $('patternNote').textContent = p
+    ? `${p.id} = ${fmt(p.total)} possible names (${p.label}). SNIPR clicks this label on the site — the space math is only shown for context.`
+    : `SNIPR will click “${ui.pattern}” on the site.`;
 }
 
-async function loadNet() {
-  const j = await fetch('/api/net').then(r => r.json()).catch(() => null);
-  if (j && j.proxy) renderNet(j.proxy);
+function selectPlatform(id) {
+  ui.platform = id;
+  for (const b of document.querySelectorAll('.platform')) b.setAttribute('aria-pressed', String(b.dataset.id === id));
+  const f = flow();
+  $('platformNote').textContent = `${f.label}: Names tab → pattern → Randomize → “${f.sniperTab}” tab → Start on ${f.site}`;
+  $('heroSite').textContent = f.siteLabel;
+  $('siteUrl').value = f.site;
+  $('namesTab').value = '';
+  $('sniperTab').value = '';
+  $('probeOut').textContent = 'not probed yet';
+  $('probeOut').className = 'muted small';
 }
 
-async function applyNet(silent) {
-  const j = await fetch('/api/net', {
-    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(netBody()),
-  }).then(r => r.json()).catch(() => null);
-  if (!j) { setNetStatus('⚠ server unreachable', 'warn'); return false; }
-  if (j.tor) renderTor(j.tor);
-  if (!j.ok) {
-    state.netToastUntil = Date.now() + 6000;
-    setNetStatus('⚠ ' + j.error, 'warn');
-    if (j.proxy) state.net = j.proxy;
-    return false;
-  }
-  // a route that saves but cannot be dialled is the #1 cause of "every name is
-  // a network error", so say it right here instead of letting a run discover it
-  if (j.route && !j.route.ok) {
-    state.netToastUntil = Date.now() + 15000;
-    setNetStatus('⚠ saved, but the route does not answer: ' + j.route.error, 'warn');
-    showSuggest(j.route);      // "press ▶ start Tor" / "a Tor does answer on 127.0.0.1:9150"
-    return true;
-  }
-  showSuggest(null);
-  if (j.route && j.route.warnings && j.route.warnings.length) {
-    state.netToastUntil = Date.now() + 8000;
-    setNetStatus('⚠ ' + j.route.warnings[0], 'warn');
-    return true;
-  }
-  if (!silent) state.netToastUntil = Date.now() + 4000;
-  setNetStatus(netLabel(j.proxy), j.proxy.mode === 'off' ? 'ok' : 'tor');
-  return true;
-}
+/* ------------------------------- render --------------------------------- */
 
-async function testNet() {
-  state.netToastUntil = Date.now() + 15000;
-  setNetStatus('testing the exit IP through the configured route…');
-  const j = await fetch('/api/net/test', { method: 'POST' }).then(r => r.json()).catch(() => null);
-  if (!j) return setNetStatus('⚠ server unreachable', 'warn');
-  if (!j.ok) return setNetStatus('⚠ ' + (j.error || 'exit test failed'), 'warn');
-  const verdict = j.isTor === true ? ' — Tor ✓' : j.isTor === false ? ' — NOT a Tor exit' : '';
-  setNetStatus(`exit IP ${j.ip}${verdict} · ${j.ms}ms · ${j.proxy}`, j.isTor ? 'ok' : 'warn');
-}
+function render(state) {
+  const b = state.browser || {};
+  const running = !!(state.run && state.run.running);
 
-$('#proxyMode').addEventListener('change', syncNetUI);
-$('#torPasswordChk').addEventListener('change', syncNetUI);
-$('#rotEvery').addEventListener('input', () => { $('#rotEveryVal').textContent = $('#rotEvery').value; });
-$('#netApply').addEventListener('click', () => applyNet(false));
-$('#netTest').addEventListener('click', testNet);
-$('#torStart').addEventListener('click', () => torAction('start'));
-$('#torStop').addEventListener('click', () => torAction('stop'));
+  const chipState = $('chipState');
+  chipState.className = 'chip' + (running ? ' live' : '');
+  chipState.querySelector('b').textContent = running ? 'sniping' : 'idle';
 
-function updateStartHint() {
-  const t = currentTarget();
-  const total = !t ? 0 : t.kind === 'pattern'
-    ? Math.pow({ L: 26, C: 36, D: 10 }[t.charset] || 26, t.len)
-    : t.kind === 'list' ? t.names.length : 0;
-  $('#startHint').textContent = total
-    ? `${fmt(total)} usernames will be checked on ${state.platform}`
-    : 'pick a pattern or paste a list';
-}
-
-/* ------------------------------ run control ------------------------------ */
-$('#startBtn').addEventListener('click', async () => {
-  const t = currentTarget();
-  if (!t) return;
-  if (t.kind === 'list' && !t.names.length) return;
-  await applyNet(true);   // the run must use exactly what the panel shows
-  const body = {
-    platform: state.platform,
-    engine: $('#engine').value,
-    target: t,
-    concurrency: Number($('#concurrency').value),
-    delay: Number($('#delay').value),
-    shuffle: $('#shuffle').checked,
-  };
-  const r = await fetch('/api/start', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
-    .then(x => x.json()).catch(() => ({ ok: false, error: 'server unreachable' }));
-  if (!r.ok) { $('#startHint').textContent = '⚠ ' + r.error; return; }
-  state.browserAbort = false;
-  state.lastCfg = body;
-  $('#runError').hidden = true;
-  $('#stopBtn').disabled = false;
-  $('#startBtn').disabled = true;
-
-  if (body.engine === 'swarm') {
-    state.swarmMode = r.swarmMode || 'hydra';
-    $('#camMode').textContent = state.swarmMode === 'playwright'
-      ? `· 6× ${r.browser || 'real browser'} on host — LIVE VIDEO`
-      : '· HYDRA — 6 real checkers in your browser';
-    $('#startHint').textContent = r.note || '';
-    if (state.swarmMode === 'hydra') startHydra(body);
+  const chipBrowser = $('chipBrowser');
+  if (b.browser) {
+    chipBrowser.textContent = `browser: ${b.browser}${b.headless ? ' (headless)' : ''}`;
+    chipBrowser.className = 'chip';
   } else {
-    state.swarmMode = null;
-    if (body.engine === 'browser') pumpBrowser(body);
+    chipBrowser.textContent = 'browser: none found';
+    chipBrowser.className = 'chip bad';
   }
-  pollSoon();
-});
 
-$('#stopBtn').addEventListener('click', async () => {
-  state.browserAbort = true;
-  stopHydra();
-  await fetch('/api/stop', { method: 'POST' });
-  $('#stopBtn').disabled = true;
-  $('#startBtn').disabled = false;
-});
+  const acc = state.login || {};
+  const chipAccount = $('chipAccount');
+  const stored = acc[ui.platform] || acc.env;
+  chipAccount.textContent = stored ? 'account: stored (memory)' : 'account: none';
+  chipAccount.className = 'chip' + (stored ? ' live' : '');
+  $('loginOut').textContent = stored ? 'stored for this process — never written to disk' : 'nothing stored yet';
 
-/* ------------------------- browser-direct engine ------------------------- */
-async function checkDiscordDirect(name) {
-  try {
-    const r = await fetch('https://discord.com/api/v9/unique-username/username-attempt-unauthed', {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ username: name }),
-    });
-    if (r.status === 429) return { name, status: 'error', note: 'rate limited' };
-    if (r.status === 400) return { name, status: 'invalid', via: 'pomelo' };
-    if (!r.ok) return { name, status: 'error', note: 'http ' + r.status };
-    const j = await r.json();
-    return { name, status: j.taken ? 'taken' : 'available', via: 'pomelo-direct' };
-  } catch (_) {
-    return { name, status: 'error', note: 'blocked by browser (CORS/network)' };
+  /* browser missing is a hard stop, said out loud */
+  if (!b.browser) {
+    $('runError').hidden = false;
+    $('runError').textContent = b.error || 'no real browser available on this machine';
+    $('startBtn').disabled = true;
+  } else if (!running) {
+    $('runError').hidden = true;
+    $('startBtn').disabled = false;
+  }
+  $('startBtn').disabled = running || !b.browser;
+  $('stopBtn').disabled = !running;
+
+  renderFlow(state);
+  renderSnipes(state);
+  renderFound(state);
+  renderTap(state);
+  renderTiles(state);
+  renderLog(state);
+  renderCams(state);
+}
+
+function renderFlow(state) {
+  const ol = $('timeline');
+  const run = state.run;
+  if (!run || !run.steps || !run.steps.length) {
+    ol.innerHTML = '';
+    ol.appendChild(el('li', 'muted small', 'press START SNIPING to walk the flow'));
+    $('workers').innerHTML = '';
+    $('workers').appendChild(el('p', 'muted empty', 'no browsers started yet'));
+    return;
+  }
+  ol.innerHTML = '';
+  run.steps.forEach((s, i) => {
+    const li = el('li', s.done >= (run.browsers || 1) ? 'done' : '');
+    li.appendChild(el('span', 'idx', String(i + 1).padStart(2, '0')));
+    li.appendChild(el('span', null, s.label));
+    li.appendChild(el('span', 'bar', `${s.done}/${s.total}`));
+    ol.appendChild(li);
+  });
+
+  const box = $('workers');
+  box.innerHTML = '';
+  const ws = run.workers || [];
+  if (!ws.length) {
+    box.appendChild(el('p', 'muted empty', 'no browsers started yet'));
+    return;
+  }
+  ws.forEach((w, i) => {
+    const row = el('div', 'worker');
+    row.dataset.s = w.status || 'idle';
+    row.appendChild(el('span', 'n', `br ${w.id || i + 1}`));
+    row.appendChild(el('span', 'st', (w.step || 'idle') + (w.stepIndex >= 0 ? ` (${w.stepIndex + 1}/${w.stepCount})` : '')));
+    const note = (w.notes && w.notes.length) ? w.notes[w.notes.length - 1].msg : 'waiting…';
+    row.appendChild(el('span', 'note', note));
+    box.appendChild(row);
+  });
+}
+
+function renderSnipes(state) {
+  const run = state.run;
+  const list = (run && run.snipes) || [];
+  $('snipedCount').textContent = fmt(list.length);
+  $('snipedNote').textContent = list.length
+    ? `newest first · the site's own words are kept next to each name`
+    : '';
+  const key = list.map(s => s.name).join(',');
+  if (key === ui.lastSnipesKey) return;
+  ui.lastSnipesKey = key;
+
+  const box = $('sniped');
+  box.innerHTML = '';
+  if (!list.length) {
+    box.appendChild(el('p', 'muted empty', 'nothing yet — the name the site reports as claimed lands here, with the exact line it came from'));
+    return;
+  }
+  for (const s of list.slice().reverse()) {
+    const row = el('div', 'snipe');
+    row.appendChild(el('span', 'who', '@' + s.name));
+    const why = el('span', 'why', `${s.via || 'site'}: ${s.why || ''}`);
+    why.title = s.why || '';
+    row.appendChild(why);
+    const meta = el('span', 'meta');
+    meta.appendChild(el('span', null, `br ${s.worker || '?'}`));
+    meta.appendChild(el('br'));
+    meta.appendChild(el('span', null, clock(s.at)));
+    row.appendChild(meta);
+    box.appendChild(row);
   }
 }
 
-async function pumpBrowser(cfg) {
-  if (state.pumping) return;
-  state.pumping = true;
-  const chunk = 25;
-  const conc = Math.max(1, Math.min(6, Number(cfg.concurrency) || 5));
-  let done = false;   // the server cursor is exhausted — every worker can stop
-  const worker = async () => {
-    while (!state.browserAbort && !done) {
-      let names = [], last = false;
-      try {
-        const j = await fetch(`/api/targets?n=${chunk}`).then(r => r.json());
-        names = j.names || []; last = !!j.done;
-      } catch (_) { break; }
-      if (!names.length) { done = true; break; }
-      let results = [];
-      if (cfg.platform === 'discord') {
-        for (const n of names) {
-          if (state.browserAbort) break;
-          results.push(await checkDiscordDirect(n));
-          if (cfg.delay > 0) await new Promise(res => setTimeout(res, cfg.delay));
-        }
-      } else {
-        const r = await fetch('/api/proxy', {
-          method: 'POST', headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ platform: cfg.platform, names }),
-        }).then(x => x.json()).catch(() => ({ results: names.map(n => ({ name: n, status: 'error', note: 'proxy failed' })) }));
-        results = r.results || [];
-        if (cfg.delay > 0) await new Promise(res => setTimeout(res, cfg.delay));
-      }
-      await fetch('/api/report', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ results }) }).catch(() => {});
-      if (last) { done = true; break; }
-    }
-  };
-  await Promise.all(Array.from({ length: conc }, worker));
-  state.pumping = false;
-  $('#stopBtn').disabled = true;
-  $('#startBtn').disabled = false;
-}
-
-/* ------------------------------ HYDRA swarm ------------------------------ */
-/* 6 Web Workers in this tab = 6 parallel REAL checkers with live telemetry.
- * Each worker pulls its next chunk from the server cursor, so the six of them
- * split the space instead of re-checking each other's names. */
-const HYDRA_SRC = `
-let checked = 0, valid = 0, current = null, last = '—', stopped = false;
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-
-async function checkOne(origin, platform, name) {
-  if (platform === 'discord') {
-    try {
-      const r = await fetch('https://discord.com/api/v9/unique-username/username-attempt-unauthed', {
-        method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ username: name }),
-      });
-      if (r.status === 429) return { name, status: 'error', note: 'rate limited' };
-      if (r.status === 400) return { name, status: 'invalid', via: 'pomelo-hydra' };
-      if (!r.ok) return { name, status: 'error', note: 'http ' + r.status };
-      const j = await r.json();
-      return { name, status: j.taken ? 'taken' : 'available', via: 'pomelo-hydra' };
-    } catch (_) { return { name, status: 'error', note: 'blocked by browser (CORS/network)' }; }
+function renderFound(state) {
+  const run = state.run;
+  const list = (run && run.found) || [];
+  $('foundCount').textContent = fmt(list.length);
+  const box = $('found');
+  box.innerHTML = '';
+  if (!list.length) {
+    box.appendChild(el('p', 'muted empty', 'available names the site mentioned are listed here — kept apart from snipes, because “available” is not “sniped”'));
+    return;
   }
-  try {
-    const j = await fetch(origin + '/api/proxy', {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ platform, names: [name] }),
-    }).then(r => r.json());
-    return (j.results && j.results[0]) || { name, status: 'error', note: 'proxy returned nothing' };
-  } catch (_) { return { name, status: 'error', note: 'proxy unreachable' }; }
-}
-
-self.onmessage = async (e) => {
-  const d = e.data || {};
-  if (d.cmd === 'stop') { stopped = true; return; }
-  if (d.cmd !== 'run') return;
-  const { origin, platform, delay, workerId, chunkSize } = d;
-  while (!stopped) {
-    let names = [], done = false;
-    try {
-      const j = await fetch(origin + '/api/targets?n=' + chunkSize).then(r => r.json());
-      names = j.names || []; done = !!j.done;
-    } catch (_) { break; }
-    if (!names.length) break;
-    const results = [];
-    for (const name of names) {
-      if (stopped) break;
-      current = name;
-      results.push(await checkOne(origin, platform, name));
-      if (delay > 0) await sleep(delay * (0.7 + Math.random() * 0.6));
-    }
-    checked += results.length;
-    valid += results.filter(x => x.status === 'available').length;
-    last = results.length ? results[results.length - 1].status : '—';
-    try {
-      await fetch(origin + '/api/report', {
-        method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ results }),
-      });
-    } catch (_) {}
-    postMessage({ type: 'batch', workerId, results, tele: { current, checked, valid, last } });
-    if (done) break;
+  for (const f of list.slice().reverse().slice(0, 60)) {
+    const item = el('div', 'item');
+    const b = el('b', null, f.name);
+    item.appendChild(b);
+    item.appendChild(el('span', null, `  ${f.via || ''} · br ${f.worker || '?'} · ${clock(f.at)}`));
+    box.appendChild(item);
   }
-  postMessage({ type: 'done', workerId, tele: { current: null, checked, valid, last: 'exited' } });
-};
-`;
+}
 
-let HYDRA_URL = null;
-
-function startHydra(cfg) {
-  if (state.hydraRunning) return;
-  state.hydraRunning = true;
-  state.lastCfg = cfg;
-  HYDRA_URL = URL.createObjectURL(new Blob([HYDRA_SRC], { type: 'application/javascript' }));
-  const chunkSize = 6;
-  let active = N_BROWSERS;
-
-  for (let w = 1; w <= N_BROWSERS; w++) {
-    let worker;
-    try { worker = new Worker(HYDRA_URL); } catch (_) { active--; continue; }
-    state.hydraWorkers.push(worker);
-    state.cams[w] = { current: null, checked: 0, valid: 0, last: 'booting…' };
-    renderCamPane(w);
-    worker.onmessage = (e) => {
-      const d = e.data;
-      if (d.type === 'batch') {
-        state.cams[d.workerId] = { ...state.cams[d.workerId], ...d.tele };
-        fetch('/api/report', {
-          method: 'POST', headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ results: d.results }),
-        }).catch(() => {});
-        renderCamPane(d.workerId);
-      } else if (d.type === 'done') {
-        state.cams[d.workerId] = { ...state.cams[d.workerId], ...d.tele };
-        renderCamPane(d.workerId);
-        if (--active <= 0) endHydra();
-      }
-    };
-    worker.onerror = () => {
-      state.cams[w] = { ...state.cams[w], current: null, last: 'worker error' };
-      renderCamPane(w);
-      if (--active <= 0) endHydra();
-    };
-    worker.postMessage({
-      cmd: 'run', origin: location.origin, platform: cfg.platform,
-      delay: cfg.delay, workerId: w, chunkSize,
-    });
+function renderTap(state) {
+  const run = state.run;
+  const list = (run && run.tap) || [];
+  const box = $('tap');
+  box.innerHTML = '';
+  if (!list.length) {
+    box.appendChild(el('p', 'muted empty', 'nothing yet'));
+    return;
   }
-  if (active <= 0) endHydra();
-}
-
-function endHydra() {
-  state.hydraRunning = false;
-  state.hydraWorkers = [];
-  if (HYDRA_URL) { URL.revokeObjectURL(HYDRA_URL); HYDRA_URL = null; }
-  $('#stopBtn').disabled = true;
-  $('#startBtn').disabled = false;
-}
-
-function stopHydra() {
-  for (const w of state.hydraWorkers) {
-    try { w.postMessage({ cmd: 'stop' }); w.terminate(); } catch (_) {}
+  for (const t of list.slice().reverse()) {
+    const item = el('div', 'item', `[${t.kind}] br${t.worker || '?'} ${t.text}`);
+    item.title = t.text;
+    box.appendChild(item);
   }
-  state.hydraWorkers = [];
-  if (state.hydraRunning) endHydra();
-  else if (HYDRA_URL) { URL.revokeObjectURL(HYDRA_URL); HYDRA_URL = null; }
 }
 
-/* ------------------------------ LIVE CAM wall ---------------------------- */
+function renderTiles(state) {
+  const run = state.run;
+  const box = $('tiles');
+  box.innerHTML = '';
+  const p = ui.patterns.find(x => x.id === (run && run.pattern));
+  const tiles = [
+    ['sniped', run ? run.snipedCount : 0, true],
+    ['browsers', run ? (run.workers || []).length : 0],
+    ['pattern', run ? run.pattern : ui.pattern],
+    ['names in space', p ? p.total : (ui.patterns.find(x => x.id === ui.pattern) || {}).total],
+    ['site says available', run ? run.foundCount : 0],
+    ['elapsed', run ? run.elapsedSec + 's' : '—'],
+  ];
+  for (const [label, value, hl] of tiles) {
+    const t = el('div', 'tile' + (hl ? ' hl' : ''));
+    t.appendChild(el('em', null, label));
+    t.appendChild(el('b', null, typeof value === 'number' ? fmt(value) : String(value)));
+    box.appendChild(t);
+  }
+}
+
+function renderLog(state) {
+  const run = state.run;
+  const ol = $('stepsLog');
+  ol.innerHTML = '';
+  const lines = (run && run.steps_log) || [];
+  if (!lines.length) {
+    ol.appendChild(el('li', 'muted', 'no steps yet'));
+    return;
+  }
+  for (const l of lines.slice(-60)) {
+    const li = el('li', l.level || 'info');
+    li.appendChild(el('time', null, clock(l.t)));
+    li.appendChild(el('span', null, `${l.worker ? `br${l.worker} ` : ''}${l.msg}`));
+    ol.appendChild(li);
+  }
+  ol.scrollTop = ol.scrollHeight;
+}
+
+/* ------------------------------ cam wall -------------------------------- */
+
+const CAMS = 6;
 function buildCams() {
-  const wrap = $('#cams');
-  wrap.innerHTML = '';
-  for (let i = 1; i <= N_BROWSERS; i++) {
-    const pane = document.createElement('div');
-    pane.className = 'cam';
-    pane.id = 'cam' + i;
-    pane.innerHTML = `
-      <div class="cam-top"><span class="cam-id">B${i}</span><span class="cam-dot"></span><span class="cam-stat" id="camstat${i}">offline</span></div>
-      <img id="camimg${i}" alt="browser ${i} live feed" hidden>
-      <div class="cam-name" id="camname${i}">—</div>
-      <div class="cam-meta" id="cammeta${i}">checked 0 · valid 0</div>
-      <div class="cam-feed" id="camfeed${i}"></div>`;
-    wrap.appendChild(pane);
+  const box = $('cams');
+  box.innerHTML = '';
+  for (let i = 1; i <= CAMS; i++) {
+    const cam = el('div', 'cam');
+    cam.dataset.n = String(i);
+    const head = el('div', 'head');
+    head.appendChild(el('b', null, `browser ${i}`));
+    const live = el('span', 'live off', '○ offline');
+    head.appendChild(live);
+    cam.appendChild(head);
+    const frame = el('div', 'frame idle');
+    const img = el('img');
+    img.alt = `live cam of browser ${i}`;
+    frame.appendChild(img);
+    cam.appendChild(frame);
+    cam.appendChild(el('div', 'foot', 'idle — no run yet'));
+    box.appendChild(cam);
   }
 }
 
-function renderCamPane(i) {
-  const t = state.cams[i];
-  if (!t) return;
-  const set = (id, v) => { const el = $(id); if (el && el.textContent !== v) el.textContent = v; };
-  set(`#camname${i}`, t.current || '—');
-  set(`#cammeta${i}`, `checked ${fmt(t.checked)} · valid ${fmt(t.valid)} · last ${t.last}`);
-  set(`#camstat${i}`, t.current ? 'sniping…' : (t.last === 'exited' ? 'done' : 'idle'));
-  const pane = $(`#cam${i}`);
-  if (pane) pane.classList.toggle('live', !!t.current);
-}
-
-function renderServerCams(meta) {
-  if (!meta || !meta.workers) return;
-  for (const w of meta.workers) {
-    state.cams[w.id] = {
-      current: w.current, checked: w.checked, valid: w.valid, last: w.last,
-    };
-    renderCamPane(w.id);
-    const img = $(`#camimg${w.id}`);
-    if (img && w.camAt && w.camAt !== state.camAt[w.id - 1]) {
-      state.camAt[w.id - 1] = w.camAt;
-      img.hidden = false;
-      img.src = `/api/cam/${w.id}.jpg?t=${w.camAt}`;
+function renderCams(state) {
+  const run = state.run;
+  const running = !!(run && run.running);
+  const ws = (run && run.workers) || [];
+  $('camMode').textContent = running ? `· ${ws.length} browsers live` : (run ? '· stopped' : '· idle');
+  for (let i = 1; i <= CAMS; i++) {
+    const cam = document.querySelector(`.cam[data-n="${i}"]`);
+    if (!cam) continue;
+    const w = ws[i - 1];
+    const img = cam.querySelector('img');
+    const live = cam.querySelector('.live');
+    const frame = cam.querySelector('.frame');
+    const foot = cam.querySelector('.foot');
+    if (!w) {
+      live.className = 'live off';
+      live.textContent = '○ offline';
+      frame.className = 'frame idle';
+      img.removeAttribute('src');
+      foot.textContent = 'idle — no run yet';
+      continue;
     }
+    const fresh = w.camAt && Date.now() - w.camAt < 5000;
+    live.className = 'live' + (fresh ? '' : ' off');
+    live.textContent = fresh ? '● live' : '○ no frame';
+    frame.className = 'frame' + (fresh ? '' : ' idle');
+    if (running || fresh) {
+      const stamp = w.camAt || 0;
+      if (img.dataset.stamp !== String(stamp)) {
+        img.dataset.stamp = String(stamp);
+        img.src = `/api/cam/${i}.jpg?t=${stamp}`;
+      }
+    }
+    const note = (w.notes && w.notes.length) ? w.notes[w.notes.length - 1].msg : 'working…';
+    foot.innerHTML = '';
+    foot.appendChild(el('b', null, w.step || 'idle'));
+    foot.appendChild(el('span', null, ` · ${note}`));
   }
 }
 
-/* ------------------------------ single check ---------------------------- */
-$('#singleBtn').addEventListener('click', async () => {
-  const name = $('#singleName').value.trim().toLowerCase();
-  if (!name) return;
-  $('#singleOut').className = 'pill';
-  $('#singleOut').textContent = '…checking';
-  const r = await fetch('/api/check', {
-    method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ platform: state.platform, name }),
-  }).then(x => x.json()).catch(() => ({ status: 'error', note: 'server unreachable' }));
-  $('#singleOut').className = 'pill ' + r.status;
-  $('#singleOut').textContent = `${name}: ${r.status}${r.note ? ' — ' + r.note : ''}`;
-});
+/* -------------------------------- actions -------------------------------- */
 
-/* ------------------------------ polling --------------------------------- */
-function pollSoon() { setTimeout(poll, 300); }
+async function post(url, body) {
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body || {}),
+  });
+  return res.json().catch(() => ({}));
+}
+
+async function start() {
+  const f = flow();
+  $('runError').hidden = true;
+  ui.lastSnipesKey = '\u0000force'; // next state render redraws the sniped list
+  const out = await post('/api/start', {
+    platform: ui.platform,
+    pattern: ui.pattern,
+    browsers: Number($('browsers').value) || 6,
+    headful: $('headful').checked,
+    site: $('siteUrl').value.trim() || f.site,
+    namesTab: $('namesTab').value.trim(),
+    sniperTab: $('sniperTab').value.trim(),
+  });
+  if (!out.ok) {
+    $('runError').hidden = false;
+    $('runError').textContent = out.error || 'could not start the run';
+    return;
+  }
+  $('startHint').textContent = out.note || '';
+}
+
+async function stop() {
+  await post('/api/stop');
+  $('startHint').textContent = 'stopping — browsers are being closed';
+}
+
+async function storeLogin() {
+  const out = await post('/api/login', {
+    platform: ui.platform,
+    email: $('loginEmail').value.trim(),
+    password: $('loginPassword').value,
+  });
+  const box = $('loginOut');
+  if (out.ok) {
+    $('loginPassword').value = '';
+    box.className = 'muted small';
+    box.textContent = 'stored for this process — sign-in happens in the browsers';
+  } else {
+    box.className = 'small';
+    box.style.color = 'var(--danger)';
+    box.textContent = out.error || 'could not store that';
+  }
+}
+
+async function verifyBrowser() {
+  const box = $('verifyOut');
+  box.className = 'muted small';
+  box.textContent = 'launching a real browser…';
+  const out = await post('/api/verify', { headful: $('headful').checked });
+  if (out.ok) {
+    box.textContent = `${out.browser} really launched and closed in ${out.ms} ms — this machine can run the run`;
+    box.className = 'small';
+    box.style.color = 'var(--acid)';
+  } else {
+    box.textContent = out.error || 'could not launch a browser';
+    box.className = 'small';
+    box.style.color = 'var(--danger)';
+  }
+}
+
+async function probe() {
+  const f = flow();
+  const box = $('probeOut');
+  box.className = 'muted small';
+  box.textContent = 'probing…';
+  const url = $('siteUrl').value.trim() || f.site;
+  const out = await post('/api/probe', { platform: ui.platform, site: url });
+  const chip = $('chipSite');
+  chip.textContent = `site: HTTP ${out.status || '—'}${out.cloudflare ? ' cf' : ''}`;
+  chip.className = 'chip' + (out.ok ? '' : ' bad');
+  box.textContent = out.note || out.error || 'no answer';
+  box.className = 'muted small';
+}
+
+async function copySnipes() {
+  const state = await (await fetch('/api/state')).json();
+  const names = ((state.run && state.run.snipes) || []).map(s => s.name);
+  const text = names.join('\n');
+  try {
+    await navigator.clipboard.writeText(text);
+    $('snipedNote').textContent = `copied ${names.length} name${names.length === 1 ? '' : 's'}`;
+  } catch (_) {
+    $('snipedNote').textContent = text ? text : 'nothing to copy';
+  }
+}
+
+/* --------------------------------- boot --------------------------------- */
 
 async function poll() {
-  clearTimeout(state.pollTimer);
-  let snap;
+  let state;
   try {
-    snap = await fetch('/api/state').then(r => r.json());
+    state = await (await fetch('/api/state')).json();
   } catch (_) {
-    state.pollTimer = setTimeout(poll, 2500);
     return;
   }
-  render(snap);
-  state.pollTimer = setTimeout(poll, 900);
+  if (state.flows && state.flows.length && (!ui.flows.length || ui.firstState)) {
+    ui.flows = state.flows;
+    buildPlatforms();
+  }
+  if (state.patterns && state.patterns.length && !ui.patterns.length) {
+    ui.patterns = state.patterns;
+    ui.pattern = ui.patterns.find(p => p.id === '4C') ? '4C' : ui.patterns[0].id;
+    buildPatterns();
+    syncPattern();
+  }
+  if (ui.firstState) {
+    selectPlatform(ui.platform);
+    ui.firstState = false;
+  }
+  render(state);
 }
 
-function render(snap) {
-  const r = snap.run;
-  if (!r) return;
-  if (r.id !== state.lastRunId) {
-    state.lastRunId = r.id;
-    state.feedRenderedKey = '';
-    state.cams = {};
-    $('#feed').innerHTML = '<div class="muted empty">waiting for first results…</div>';
-    for (let i = 1; i <= N_BROWSERS; i++) { state.cams[i] = { current: null, checked: 0, valid: 0, last: '—' }; renderCamPane(i); const img = $(`#camimg${i}`); if (img) { img.hidden = true; img.removeAttribute('src'); } }
-  }
-  if (snap.proxy) renderNet(snap.proxy);
-  const route = snap.proxy && snap.proxy.mode !== 'off' ? ` · ${snap.proxy.mode === 'tor' ? '🧅 tor' : '↻ ' + snap.proxy.list.length + ' proxies'}` : '';
-  $('#runDesc').textContent = `${r.platform} · ${r.engine} engine · ${r.targetDesc}${route}`;
-  $('#stTotal').textContent = fmt(r.total);
-  $('#stChecked').textContent = fmt(r.checked);
-  $('#stValid').textContent = fmt(r.availableCount);
-  $('#stTaken').textContent = fmt(r.takenCount);
-  $('#stInvalid').textContent = fmt(r.invalidCount);
-  $('#stPremium').textContent = fmt(r.premiumCount);
-  $('#stErrors').textContent = fmt(r.errorCount);
-  $('#stLeft').textContent = fmt(r.remaining);
-  $('#stRate').textContent = fmt(r.ratePerMin);
-  $('#stEta').textContent = r.etaSec == null ? '∞' : r.etaSec > 86400
-    ? Math.round(r.etaSec / 86400) + 'd' : r.etaSec > 3600
-      ? Math.round(r.etaSec / 3600) + 'h' : r.etaSec > 60
-        ? Math.round(r.etaSec / 60) + 'm' : r.etaSec + 's';
-  const pct = r.total ? Math.min(100, (r.checked / r.total) * 100) : 0;
-  $('#progressBar').style.width = pct.toFixed(2) + '%';
-
-  if (!r.running) {
-    $('#stopBtn').disabled = true;
-    $('#startBtn').disabled = false;
-  } else if (!state.hydraRunning && !state.pumping) {
-    $('#stopBtn').disabled = false;
-    $('#startBtn').disabled = true;
-  }
-
-  // surface why a run died instead of silently flipping back to idle
-  const err = r.error || (snap.swarm && snap.swarm.error) || null;
-  const errEl = $('#runError');
-  if (err) { errEl.hidden = false; errEl.textContent = '⚠ ' + err; } else { errEl.hidden = true; }
-
-  // the target is throttling/blocking us: every worker is paused, so the error
-  // rows stop instead of piling up. Say so, and point at the fix (delay/route).
-  const th = r.throttle || null;
-  const thEl = $('#runThrottle');
-  if (th && th.active) {
-    const left = Math.max(1, Math.ceil((th.waitMs || 0) / 1000));
-    thEl.textContent = `⏸ ${r.platform} is throttling this IP (hit ${th.hits}) — all workers paused ${left}s. `
-      + 'Raise the delay, or rotate the route (exit IP) in section 4.';
-    thEl.hidden = false;
-  } else thEl.hidden = true;
-
-  // cam wall source of truth
-  if (snap.swarm && snap.swarm.meta) {
-    const label = '· 6× ' + (snap.swarm.meta.browser || 'real browser') + ' on host — LIVE VIDEO';
-    if ($('#camMode').textContent !== label) $('#camMode').textContent = label;
-    renderServerCams(snap.swarm.meta);
-  } else if (state.hydraRunning || Object.values(state.cams).some(c => c.checked)) {
-    const label = '· HYDRA — 6 real checkers in your browser';
-    if ($('#camMode').textContent !== label) $('#camMode').textContent = label;
-  }
-
-  // the swarm engine without a real browser on the host (or a host swarm that
-  // died on launch) keeps running as 6 real in-browser workers
-  if (r.running && r.engine === 'swarm' && snap.swarm && snap.swarm.mode === 'hydra'
-      && !state.hydraRunning && !state.browserAbort && state.lastCfg) {
-    startHydra(state.lastCfg);
-  }
-
-  renderFeed(r);
+function wire() {
+  $('startBtn').addEventListener('click', start);
+  $('stopBtn').addEventListener('click', stop);
+  $('loginBtn').addEventListener('click', storeLogin);
+  $('probeBtn').addEventListener('click', probe);
+  $('verifyBtn').addEventListener('click', verifyBrowser);
+  $('copySnipes').addEventListener('click', copySnipes);
+  $('browsers').addEventListener('input', e => { $('browsersVal').textContent = e.target.value; });
+  $('patternCustom').addEventListener('input', e => {
+    const v = e.target.value.trim().toUpperCase();
+    if (v) { ui.pattern = v; syncPattern(); }
+  });
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) start();
+  });
 }
 
-function renderFeed(r) {
-  let rows = r.feed || [];
-  if (state.feedFilter === 'available') rows = rows.filter(x => x.status === 'available');
-  else if (state.feedFilter === 'taken') rows = rows.filter(x => x.status === 'taken');
-  else if (state.feedFilter === 'error') rows = rows.filter(x => x.status === 'error' || x.status === 'invalid');
-
-  const key = r.checked + ':' + rows.length + ':' + state.feedFilter + ':' + (rows[rows.length - 1]?.seq || 0);
-  if (key === state.feedRenderedKey) return;
-  state.feedRenderedKey = key;
-
-  const el = $('#feed');
-  if (!rows.length) {
-    el.innerHTML = '<div class="muted empty">no rows for this filter yet…</div>';
-    return;
-  }
-  el.innerHTML = rows.slice().reverse().map(x => {
-    const url = x.status === 'available' ? PLATFORM_URL[r.platform]?.(x.name) : null;
-    const time = new Date(x.t).toLocaleTimeString();
-    const note = x.note ? ` — ${x.note}` : '';
-    return `<div class="frow ${x.status}">
-      <span class="fname">${esc(x.name)}</span>
-      <span class="fstat">${{ available: 'VALID ✅', taken: 'taken ❌', invalid: 'invalid ⚠', premium: 'premium 💎', error: 'error ⚠' }[x.status] || x.status}</span>
-      <span class="fvia">${esc(x.via || '')}${esc(note)}</span>
-      ${url ? `<a href="${url}" target="_blank" rel="noopener">open ↗</a>` : ''}
-      <span class="ftime">${time}</span>
-    </div>`;
-  }).join('');
-}
-
-const esc = (s) => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
-
-$$('.tab[data-feed]').forEach(btn => btn.addEventListener('click', () => {
-  $$('.tab[data-feed]').forEach(b => b.classList.remove('active'));
-  btn.classList.add('active');
-  state.feedFilter = btn.dataset.feed;
-  state.feedRenderedKey = '';
-}));
-
-/* --------------------------- copy / download ---------------------------- */
-$('#copyHits').addEventListener('click', async () => {
-  const snap = await fetch('/api/state').then(r => r.json()).catch(() => null);
-  const hits = snap?.run?.available || [];
-  try { await navigator.clipboard.writeText(hits.join('\n')); $('#copyHits').textContent = '⧉ copied!'; }
-  catch (_) { $('#copyHits').textContent = '⧉ ' + hits.length + ' hits'; }
-  setTimeout(() => { $('#copyHits').textContent = '⧉ copy valid'; }, 1500);
-});
-
-/* --------------------------- network badge ------------------------------ */
-(async () => {
-  const badge = $('#netBadge');
-  const set = (t, c) => { badge.textContent = t; badge.style.color = c; };
-  try {
-    const r = await fetch('/api/check', {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ platform: 'discord', engine: 'server', name: 'zzqx9v' }),
-    }).then(x => x.json());
-    if (r.status === 'error') set('● host: outbound blocked → run from your browser (HYDRA)', 'var(--amber)');
-    else set('● host: outbound OK (probe: discord ' + r.status + ')', 'var(--green)');
-  } catch (_) {
-    set('● server unreachable', 'var(--red)');
-  }
-  // playwright present on host?
-  try {
-    const s = await fetch('/api/swarm').then(x => x.json());
-    if (s.browser) badge.title = `swarm: ${s.browser} detected — 6 real browsers ready`;
-    else if (s.available) badge.title = 'swarm: playwright installed but no real browser found — run `npx playwright install chromium` or install Google Chrome';
-    else badge.title = 'swarm: playwright not installed on host → HYDRA fallback (6 real checkers in your browser)';
-  } catch (_) {}
-})();
-
-/* ------------------------------- boot ----------------------------------- */
-(async () => {
-  $('.platform[data-platform="gunslol"]').classList.add('active');
-  $('#lenRange').value = 3;
-  $('#lenVal').textContent = '3';
-  $('#useLetters').checked = true;
-  $('#useDigits').checked = false;
-  buildCams();
-  for (let i = 1; i <= N_BROWSERS; i++) state.cams[i] = { current: null, checked: 0, valid: 0, last: '—' };
-  syncPatternUI();
-  updateEngineNote();
-  syncNetUI();
-  loadNet();
-  poll();
-})();
+buildCams();
+wire();
+poll();
+setInterval(poll, 1200);

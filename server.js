@@ -1,308 +1,147 @@
 'use strict';
 /*
- * SNIPR — multi-platform username sniper (guns.lol / Discord / Instagram / TikTok)
- * Zero-dependency Node server (Node 18+, uses built-in fetch).
+ * SNIPR — real-browser sniper console.
  *
- *   node server.js            # PORT=3000 by default, binds 0.0.0.0
+ *   node server.js          # PORT=3000 by default, binds 0.0.0.0
  *
- * Engines (all real, no simulation):
- *   server  – real checks from this machine (copied GitHub-tool logic)
- *   browser – real checks from YOUR browser (Discord direct via CORS,
- *             others proxied through /api/proxy)
- *   swarm   – SIX real headless browsers in parallel with live screenshot
- *             cams (uses the Chrome/Edge already installed on the host, or
- *             playwright's chromium; if no real browser exists the run falls
- *             back to HYDRA — 6 real checkers inside the user's browser)
+ * One job, done for real: open SIX real Chromium browsers on the sniper site
+ * (usersniper.com) and walk the flow —
  *
- * Every engine can run through the rotating proxy layer (lib/proxy.js):
- * Tor circuits (per-request SOCKS5 isolation +SIGNAL NEWNYM) or a round-robin
- * proxy list. See GET/POST /api/net and POST /api/net/test.
+ *   Names tab -> 4C -> wait for the names -> Randomize -> <platform> Sniper
+ *   tab -> Start -> report the name the SITE says it sniped
+ *
+ * Every browser is a real browser with a live screenshot on the dashboard, and
+ * the only names the dashboard shows as "sniped" are the ones the site itself
+ * reported (its own fetch/XHR/WebSocket traffic, or the text it rendered).
+ * There is no demo mode and no simulated result anywhere in this code.
+ *
+ * It expects an account you already have: paste your login in the UI (kept in
+ * memory only) or set USERSNIPER_EMAIL / USERSNIPER_PASSWORD. It never creates
+ * an account for you.
  */
 
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
-const { liveCheck } = require('./lib/checkers');
-const { Swarm, bind, detectPlaywright, detectBrowser, swarm } = require('./lib/swarm');
-const proxyPool = require('./lib/proxy');
-const torLayer = require('./lib/tor');
-const { exitCheck } = require('./lib/http');
 const {
-  describeTarget, totalFor, nameAt, makeOrder, PATTERN_PRESETS, mulberry32,
-} = require('./lib/generator');
-
-// let the swarm module use the run cursor + recorder without circular imports
-bind(nameAt, (run, name, res) => record(run, name, res));
+  siteSniper, FLOWS, PATTERNS, browserReport, verifyBrowser, analyzeSiteText,
+} = require('./lib/siteflow');
 
 const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || '0.0.0.0';
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const RESULTS_DIR = path.join(__dirname, 'results');
-const MAX_CONCURRENCY = 24;
-const FEED_CAP = 400;        // recent rows kept for the UI feed
-const AVAILABLE_CAP = 20000; // in-memory list of hits (count keeps going)
-const COUNTED_CAP = 400000;  // names tracked for exact de-duplication
-
-const PLATFORMS = {
-  gunslol: { id: 'gunslol', label: 'guns.lol', url: (u) => `https://guns.lol/${u}`, accent: '#ff2e4d' },
-  discord: { id: 'discord', label: 'Discord', url: () => 'https://discord.com', accent: '#5865F2' },
-  instagram: { id: 'instagram', label: 'Instagram', url: (u) => `https://instagram.com/${u}`, accent: '#e1306c' },
-  tiktok: { id: 'tiktok', label: 'TikTok', url: (u) => `https://tiktok.com/@${u}`, accent: '#25f4ee' },
-};
 
 fs.mkdirSync(RESULTS_DIR, { recursive: true });
 
-/* ------------------------------ run state -------------------------------- */
-let run = null;       // the single active (or last) run
+let run = null;
 let runSeq = 0;
 
 function newRun(cfg) {
-  const total = totalFor(cfg.target);
-  const seed = (Math.random() * 0xffffffff) >>> 0;
   return {
     id: ++runSeq,
     platform: cfg.platform,
-    engine: cfg.engine,
-    target: cfg.target,
-    targetDesc: describeTarget(cfg.target),
-    order: makeOrder(cfg.target, cfg.shuffle, seed),
-    concurrency: cfg.concurrency,
-    delay: cfg.delay,
-    total,
-    cursor: 0,       // names handed out to browser workers so far (disjoint)
-    counted: new Set(), // every name already recorded — nothing counts twice
-    checked: 0,
-    available: [],   // names (capped at AVAILABLE_CAP)
-    availableCount: 0,
-    takenCount: 0,
-    invalidCount: 0,
-    premiumCount: 0,
-    errorCount: 0,
-    feed: [],        // recent rows, newest last
-    startedAt: null,
+    pattern: cfg.pattern,
+    browsers: cfg.browsers,
+    running: true,
+    startedAt: Date.now(),
     finishedAt: null,
-    running: false,
     abort: false,
-    error: null,     // why a run died (e.g. swarm launch failure) — shown in the UI
-    rateWindow: [],  // {t, n} for rolling rate
-    lastErrors: [],
-    cooldownUntil: 0, // wall clock until which every worker pauses
-    throttleHits: 0,  // consecutive rate-limit/block answers (drives the backoff)
+    error: null,
+    snipes: [],
+    found: [],
+    foundNames: new Set(),
+    tap: [],
+    steps: [],
+    steps_log: [],
+    flow: null,
   };
 }
 
-function record(state, name, res) {
-  // De-duplicate: a name can only ever count once per run, so "checked" stays
-  // exact even if several browser workers overlap.
-  if (state.counted.has(name)) return;
-  if (state.counted.size < COUNTED_CAP) state.counted.add(name);
-  state.checked++;
-  const now = Date.now();
-  state.rateWindow.push({ t: now, n: 1 });
-  if (state.rateWindow.length > 4096) state.rateWindow.splice(0, 2048);
-
-  if (res.status === 'available') {
-    state.availableCount++;
-    if (state.available.length < AVAILABLE_CAP) state.available.push(name);
-  } else if (res.status === 'taken') state.takenCount++;
-  else if (res.status === 'invalid') state.invalidCount++;
-  else if (res.status === 'premium') state.premiumCount++;
-  else state.errorCount++;
-
-  state.feed.push({ seq: state.checked, name, status: res.status, via: res.via, note: res.note, t: now });
-  if (state.feed.length > FEED_CAP) state.feed.splice(0, state.feed.length - FEED_CAP);
-
-  if (res.status === 'error' && state.lastErrors.length < 20) {
-    state.lastErrors.push(`${name}: ${res.note || 'error'}`);
-  }
-
-  // persist hits
-  if (res.status === 'available') {
-    const tag = `${state.platform}_${state.target.kind === 'pattern' ? state.target.len + state.target.charset : state.target.kind}`;
-    fs.appendFile(path.join(RESULTS_DIR, `hits_${tag}.txt`), name + '\n', () => {});
-  }
-}
-
-function ratePerMin(state) {
-  const now = Date.now();
-  const recent = state.rateWindow.filter(p => now - p.t < 15000);
-  if (recent.length < 2) return 0;
-  const span = Math.max(1, now - recent[0].t);
-  return Math.round((recent.length / span) * 60000);
-}
-
-function stateSnapshot(state) {
-  if (!state) {
-    return { run: null, swarm: { available: !!detectPlaywright(), browser: detectBrowser(), error: null, mode: null, meta: null }, platforms: platformMeta(), presets: PATTERN_PRESETS, proxy: proxyPool.status() };
-  }
-  const checked = state.checked;
-  const rate = state.running ? ratePerMin(state) : 0;
-  const remaining = Math.max(0, state.total - checked);
+function publicFlow(flow) {
   return {
-    swarm: {
-      available: !!detectPlaywright(),
-      browser: detectBrowser(),   // e.g. "Google Chrome", null when none found
-      error: run.error || swarm.lastError || null,
-      mode: state.engine === 'swarm' ? (swarm.running ? 'playwright' : (detectBrowser() ? 'playwright' : 'hydra')) : null,
-      meta: swarm.running ? swarm.meta() : null,
-    },
-    run: {
-      id: state.id,
-      platform: state.platform,
-      engine: state.engine,
-      targetDesc: state.targetDesc,
-      total: state.total,
-      checked,
-      handedOut: state.cursor,
-      availableCount: state.availableCount,
-      takenCount: state.takenCount,
-      invalidCount: state.invalidCount,
-      premiumCount: state.premiumCount,
-      errorCount: state.errorCount,
-      remaining,
-      running: state.running,
-      error: state.error,
-      ratePerMin: rate,
-      etaSec: rate > 0 ? Math.round((remaining / rate) * 60) : (state.running && state.total ? null : 0),
-      elapsedSec: state.startedAt ? Math.round(((state.finishedAt || Date.now()) - state.startedAt) / 1000) : 0,
-      feed: state.feed.slice(-120),
-      available: state.available.slice(-2000),
-      lastErrors: state.lastErrors.slice(-10),
-      concurrency: state.concurrency,
-      delay: state.delay,
-      throttle: {
-        active: (state.cooldownUntil || 0) > Date.now(),
-        until: state.cooldownUntil || 0,
-        hits: state.throttleHits || 0,
-        waitMs: Math.max(0, (state.cooldownUntil || 0) - Date.now()),
-      },
-    },
-    platforms: platformMeta(),
-    presets: PATTERN_PRESETS,
-    proxy: proxyPool.status(),
+    id: flow.id,
+    label: flow.label,
+    accent: flow.accent,
+    site: flow.site,
+    siteLabel: flow.siteLabel,
+    namesTab: flow.namesTab[0],
+    sniperTab: flow.sniperTab[0],
   };
 }
 
-function platformMeta() {
-  const out = {};
-  for (const k of Object.keys(PLATFORMS)) out[k] = { id: k, label: PLATFORMS[k].label, accent: PLATFORMS[k].accent };
-  return out;
-}
-
-/* ------------------------------ engines ---------------------------------- */
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-
-/* When a platform throttles or blocks us, every worker pauses instead of adding
- * fuel to the fire. The wait grows with each consecutive hit and decays as
- * answers come back healthy again. */
-const THROTTLE_BASE_MS = 2000;
-const THROTTLE_MAX_MS = 30000;
-
-/* A route that fails to dial is not a target responding badly: every name would
- * be marked as an error and the site would get the blame. Give up on the run
- * and say so instead. */
-const PROXY_FAILS_BEFORE_ABORT = 3;
-
-/* Same idea for a target that refuses every request: once a whole batch comes
- * back 401/403 with no healthy answer in between, the run is not unlucky — it is
- * blocked. Stop and say why instead of turning the wordlist into error rows. */
-const BLOCKED_BEFORE_ABORT = 12;
-
-function throttle(state) {
-  state.throttleHits = Math.min(6, (state.throttleHits || 0) + 1);
-  const wait = Math.min(THROTTLE_MAX_MS, THROTTLE_BASE_MS * Math.pow(2, state.throttleHits - 1));
-  state.cooldownUntil = Math.max(state.cooldownUntil || 0, Date.now() + wait);
-  return wait;
-}
-
-async function runServerEngine(state) {
-  state.running = true;
-  state.startedAt = Date.now();
-  const cursor = { i: 0 };
-  let proxyFails = 0;
-  let blockedFails = 0;
-  const nworkers = Math.max(1, Math.min(MAX_CONCURRENCY, state.concurrency || 5));
-
-  const pauseWhileCooling = async () => {
-    while (!state.abort) {
-      const wait = (state.cooldownUntil || 0) - Date.now();
-      if (wait <= 0) return;
-      await sleep(Math.min(wait, 1000));
-    }
+function snapshot() {
+  const browser = browserReport();
+  const base = {
+    ok: true,
+    now: Date.now(),
+    browser,
+    login: siteSniper.loginState(),
+    flows: Object.values(FLOWS).map(publicFlow),
+    patterns: PATTERNS,
+    run: null,
   };
-
-  const worker = async () => {
-    while (!state.abort) {
-      if ((state.cooldownUntil || 0) > Date.now()) {
-        await pauseWhileCooling();
-        if (state.abort) return;
-      }
-      const i = cursor.i++;
-      if (i >= state.total) return;
-      const name = nameAt(state.target, state.order, i);
-      let res;
-      try {
-        res = await liveCheck(state.platform, name);
-      } catch (e) {
-        res = { status: 'error', http: 0, via: 'exception', kind: e.kind, note: String(e.message || e).slice(0, 140) };
-      }
-      if (res.kind === 'proxy') {
-        proxyFails++;
-        if (proxyFails >= PROXY_FAILS_BEFORE_ABORT && !state.abort) {
-          state.error = `proxy route unreachable — stopped after ${proxyFails} straight failures: ${res.note}`;
-          state.abort = true;
-        }
-      } else if (res.status !== 'error') {
-        proxyFails = 0;
-        blockedFails = 0;
-        state.throttleHits = Math.max(0, state.throttleHits - 1);
-      } else if (res.kind === 'blocked') {
-        // A refused exit is not a rate limit: pausing changes nothing about an
-        // IP the target has decided to reject, so count the wall and stop.
-        blockedFails++;
-        if (blockedFails >= BLOCKED_BEFORE_ABORT && !state.abort) {
-          state.error = `every check is being rejected — stopped after ${blockedFails} straight blocks: ${res.note}`;
-          state.abort = true;
-        }
-      } else if (res.kind === 'ratelimited') {
-        blockedFails = 0;
-        throttle(state);
-      }
-      record(state, name, res);
-      if (state.delay > 0) {
-        const jitter = state.delay * (0.7 + Math.random() * 0.6);
-        await sleep(jitter);
-      }
-    }
+  if (!run) return base;
+  const elapsedSec = run.startedAt ? Math.round(((run.finishedAt || Date.now()) - run.startedAt) / 1000) : 0;
+  base.run = {
+    id: run.id,
+    platform: run.platform,
+    pattern: run.pattern,
+    browsers: run.browsers,
+    running: run.running && !run.abort,
+    error: run.error,
+    startedAt: run.startedAt,
+    finishedAt: run.finishedAt,
+    elapsedSec,
+    flow: run.flow,
+    steps: run.steps,
+    steps_log: run.steps_log.slice(-80),
+    snipes: run.snipes.slice(-200),
+    snipedCount: run.snipes.length,
+    found: run.found.slice(-60),
+    foundCount: run.found.length,
+    tap: run.tap.slice(-40),
+    workers: siteSniper.meta().workers,
+    workerError: siteSniper.meta().error,
   };
-
-  await Promise.all(Array.from({ length: nworkers }, worker));
-  state.running = false;
-  state.finishedAt = Date.now();
+  return base;
 }
 
-/* ------------------------------ http utils ------------------------------- */
+/* ------------------------------- http utils ------------------------------- */
 function json(res, code, obj) {
   const body = JSON.stringify(obj);
   res.writeHead(code, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
   res.end(body);
 }
 
-function readBody(req, limit = 4 * 1024 * 1024) {
+function readBody(req, limit = 1024 * 256) {
   return new Promise((resolve, reject) => {
-    let size = 0; const chunks = [];
-    req.on('data', c => { size += c.length; if (size > limit) { reject(new Error('body too large')); req.destroy(); } else chunks.push(c); });
+    let size = 0;
+    const chunks = [];
+    req.on('data', c => {
+      size += c.length;
+      if (size > limit) { reject(new Error('body too large')); req.destroy(); }
+      else chunks.push(c);
+    });
     req.on('end', () => {
       try { resolve(chunks.length ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : {}); }
-      catch (e) { reject(new Error('invalid json')); }
+      catch (_) { reject(new Error('invalid json')); }
     });
     req.on('error', reject);
   });
 }
 
-const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon' };
+const MIME = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.ico': 'image/x-icon',
+};
 
-function serveStatic(req, res, urlPath) {
+function serveStatic(res, urlPath) {
   let p = urlPath === '/' ? '/index.html' : urlPath;
   p = path.normalize(p).replace(/^([.][.][/\\])+/, '');
   const file = path.join(PUBLIC_DIR, p);
@@ -314,265 +153,163 @@ function serveStatic(req, res, urlPath) {
   });
 }
 
-/* ------------------------------ server ----------------------------------- */
+/* Can this machine reach the sniper site at all? (The browsers do the real work;
+ * this only explains a blank screen and tells you when Cloudflare is refusing
+ * the server — which is normal and not what the real browsers see.) */
+async function probeSite(url) {
+  const started = Date.now();
+  try {
+    const res = await fetch(url, {
+      redirect: 'follow',
+      headers: {
+        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+        accept: 'text/html,application/xhtml+xml',
+      },
+      signal: AbortSignal.timeout(20000),
+    });
+    const server = res.headers.get('server') || '';
+    const cf = /cloudflare/i.test(server) || !!res.headers.get('cf-ray');
+    return {
+      ok: res.ok,
+      status: res.status,
+      server,
+      cloudflare: cf,
+      ms: Date.now() - started,
+      note: res.ok
+        ? `${url} answers HTTP ${res.status}${cf ? ' (Cloudflare)' : ''} — a real browser passes it`
+        : `${url} answers HTTP ${res.status}${cf ? ' (Cloudflare)' : ''} to this server; the real browsers in the flow may still get through`,
+    };
+  } catch (e) {
+    return { ok: false, status: 0, ms: Date.now() - started, error: String(e.message || e).slice(0, 200), note: `this server cannot reach ${url} (${String(e.message || e).slice(0, 120)})` };
+  }
+}
+
+/* --------------------------------- server -------------------------------- */
 const server = http.createServer(async (req, res) => {
   const u = new URL(req.url, 'http://x');
   const p = u.pathname;
   try {
-    if (req.method === 'GET' && p === '/api/meta') {
-      return json(res, 200, stateSnapshot(run));
-    }
-    if (req.method === 'GET' && p === '/api/state') {
-      return json(res, 200, stateSnapshot(run));
-    }
+    if (req.method === 'GET' && (p === '/api/state' || p === '/api/meta')) return json(res, 200, snapshot());
+    if (req.method === 'GET' && p === '/api/health') return json(res, 200, { ok: true, uptime: process.uptime() });
 
     if (req.method === 'POST' && p === '/api/start') {
       const body = await readBody(req);
-      const platform = String(body.platform || '');
-      const engine = String(body.engine || 'server');
-      if (!PLATFORMS[platform]) return json(res, 400, { ok: false, error: 'unknown platform' });
-      if (!['server', 'browser', 'swarm'].includes(engine)) return json(res, 400, { ok: false, error: 'bad engine' });
-      if (run && run.running && !run.abort) return json(res, 409, { ok: false, error: 'a run is already active — stop it first' });
+      const platform = String(body.platform || 'discord');
+      const flow = FLOWS[platform];
+      if (!flow) return json(res, 400, { ok: false, error: 'unknown platform — pick discord or gunslol' });
+      if (run && run.running && !run.abort) return json(res, 409, { ok: false, error: 'a run is already going — press Stop first' });
 
-      let target;
-      if (body.target && body.target.kind === 'pattern') {
-        const len = Math.max(1, Math.min(6, Number(body.target.len) || 0));
-        const charset = ['L', 'C', 'D'].includes(body.target.charset) ? body.target.charset : 'L';
-        target = { kind: 'pattern', len, charset };
-      } else if (body.target && body.target.kind === 'list') {
-        const names = [...new Set(String(body.target.names || '').split(/[\s,;]+/).map(s => s.trim().toLowerCase()).filter(Boolean))];
-        if (!names.length) return json(res, 400, { ok: false, error: 'empty list' });
-        if (names.length > 200000) return json(res, 400, { ok: false, error: 'list too large (max 200k)' });
-        target = { kind: 'list', names };
-      } else if (body.target && body.target.kind === 'single') {
-        const name = String(body.target.name || '').trim().toLowerCase();
-        if (!name) return json(res, 400, { ok: false, error: 'empty name' });
-        target = { kind: 'single', name };
-      } else {
-        return json(res, 400, { ok: false, error: 'missing target' });
-      }
+      const browsers = Math.max(1, Math.min(6, Number(body.browsers) || 6));
+      const cfg = {
+        platform,
+        pattern: String(body.pattern || '4C').trim().toUpperCase().slice(0, 12),
+        browsers,
+        flow: platform,
+        site: String(body.site || flow.site).trim(),
+        namesTab: String(body.namesTab || '').trim() || null,
+        sniperTab: String(body.sniperTab || '').trim() || null,
+        headful: !!body.headful,
+      };
 
-      // Refuse to start on a route that cannot be dialled at all — otherwise
-      // every name comes back "network error" and the platform gets the blame.
-      const route = await proxyPool.checkRoute();
-      if (!route.ok) {
-        return json(res, 400, {
-          ok: false,
-          error: `proxy route unreachable (${route.error}) — fix section 4 (is Tor running? is the proxy alive?) or set the route to direct`
-            + (route.hint ? ` — ${route.hint}` : ''),
-          route, proxy: proxyPool.status(),
-        });
-      }
+      const rep = browserReport();
+      if (!rep.browser) return json(res, 400, { ok: false, error: rep.error, browser: rep });
 
-      run = newRun({
-        platform, engine, target,
-        concurrency: Math.max(1, Math.min(MAX_CONCURRENCY, Number(body.concurrency) || 5)),
-        delay: Math.max(0, Math.min(10000, Number(body.delay) || 0)),
-        shuffle: body.shuffle !== false,
-      });
-
-      let swarmMode = null;
-      let note = null;
-      if (engine === 'server') {
-        runServerEngine(run).catch(e => {
-          run.error = 'server engine crashed: ' + String(e.message || e).slice(0, 180);
-          run.running = false;
-          console.error('[SNIPR] server engine crashed:', e);
-        });
-      } else if (engine === 'swarm' && detectBrowser()) {
-        swarmMode = 'playwright';
-        note = 'swarming with ' + detectBrowser();
-        swarm.start(run, 6).catch(e => {
-          console.error('[SNIPR] swarm crashed:', e);
-          run.error = 'swarm crashed: ' + String(e.message || e).slice(0, 180);
+      run = newRun(cfg);
+      siteSniper.start(run, cfg).then(() => {
+        if (run) { run.running = false; run.finishedAt = run.finishedAt || Date.now(); }
+      }).catch(e => {
+        if (run) {
+          run.error = String(e.message || e).slice(0, 240);
           run.running = false;
           run.finishedAt = Date.now();
-        });
-      } else {
-        // browser engine, or swarm with no real browser on the host -> HYDRA:
-        // 6 workers inside the user's browser doing REAL checks.
-        if (engine === 'swarm') {
-          swarmMode = 'hydra';
-          note = detectPlaywright()
-            ? 'no Chrome/Edge found on host — running 6 workers in your browser'
-            : 'playwright not installed on host — running 6 workers in your browser';
         }
-        run.running = true;
-        run.startedAt = Date.now();
-      }
+      });
+
       return json(res, 200, {
-        ok: true, runId: run.id, total: run.total, orderSeed: run.order,
-        swarmMode, note, browser: detectBrowser(), proxy: proxyPool.describe(),
+        ok: true,
+        runId: run.id,
+        browser: rep.browser,
+        browsers,
+        flow: publicFlow(flow),
+        pattern: cfg.pattern,
+        total: (PATTERNS.find(x => x.id === cfg.pattern) || {}).total || null,
+        note: `${rep.browser} x${browsers} — walking the ${flow.label} flow on ${cfg.site}`,
       });
     }
 
     if (req.method === 'POST' && p === '/api/stop') {
-      if (run) { run.abort = true; }
-      swarm.stop().catch(() => {});
+      if (run) { run.abort = true; run.running = false; run.finishedAt = Date.now(); }
+      await siteSniper.stop();
       return json(res, 200, { ok: true });
     }
 
-    if (req.method === 'POST' && p === '/api/check') { // single ad-hoc check
+    /* Your account, your credentials: held in memory for this process only,
+     * never written to disk, never sent anywhere except the login form of the
+     * site you pointed it at. */
+    if (req.method === 'POST' && p === '/api/login') {
       const body = await readBody(req);
-      const name = String(body.name || '').trim().toLowerCase();
-      const platform = String(body.platform || '');
-      if (!name || !PLATFORMS[platform]) return json(res, 400, { ok: false, error: 'bad request' });
-      let out;
-      try {
-        out = { name, ...(await liveCheck(platform, name)) };
-      } catch (e) {
-        out = { name, status: 'error', note: String(e.message || e).slice(0, 140) };
-      }
+      const platform = String(body.platform || 'discord');
+      if (!FLOWS[platform]) return json(res, 400, { ok: false, error: 'unknown platform' });
+      const email = String(body.email || '').trim();
+      const password = String(body.password || '');
+      if (!email || !password) return json(res, 400, { ok: false, error: 'email and password are both required' });
+      siteSniper.setCreds(platform, email, password);
+      return json(res, 200, { ok: true, login: siteSniper.loginState() });
+    }
+
+    /* Actually launches a browser and closes it again — the only honest way to
+     * answer "can this machine run the six browsers?". */
+    if (req.method === 'POST' && p === '/api/verify') {
+      const body = await readBody(req);
+      const out = await verifyBrowser({ headless: !body.headful && !process.env.SNIPR_HEADFUL });
       return json(res, 200, out);
     }
 
-    if (req.method === 'POST' && p === '/api/proxy') { // hydra/browser engine: server-side batch check
+    if (req.method === 'POST' && p === '/api/probe') {
       const body = await readBody(req);
-      const platform = String(body.platform || '');
-      const names = Array.isArray(body.names) ? body.names.slice(0, 60).map(s => String(s).toLowerCase()) : [];
-      if (!PLATFORMS[platform] || !names.length) return json(res, 400, { ok: false, error: 'bad request' });
-      const out = [];
-      for (const name of names) {
-        try { const r = await liveCheck(platform, name); out.push({ name, status: r.status, via: r.via, note: r.note }); }
-        catch (e) { out.push({ name, status: 'error', note: String(e.message || e).slice(0, 140) }); }
-      }
-      return json(res, 200, { results: out });
+      const flow = FLOWS[String(body.platform || 'discord')];
+      const url = String(body.site || (flow ? flow.site : '')).trim();
+      if (!/^https?:\/\//.test(url)) return json(res, 400, { ok: false, error: 'need an http(s) url' });
+      return json(res, 200, await probeSite(url));
     }
 
-    if (req.method === 'POST' && p === '/api/report') { // browser/hydra workers report results
-      const body = await readBody(req);
-      if (run && (run.engine === 'browser' || run.engine === 'swarm') && !run.abort && Array.isArray(body.results)) {
-        for (const r of body.results.slice(0, 200)) {
-          record(run, String(r.name || '').toLowerCase(), { status: r.status, via: r.via, note: r.note });
-        }
-        if (run.checked >= run.total) { run.running = false; run.finishedAt = Date.now(); }
-      }
-      return json(res, 200, { ok: true });
-    }
-
-    if (req.method === 'GET' && p === '/api/targets') {
-      // browser/hydra workers pull the next chunk. The SERVER owns the cursor,
-      // so every name is handed out exactly once — no duplicate work, no early
-      // "finish" caused by the same name being reported by several workers.
-      if (!run || (run.engine !== 'browser' && run.engine !== 'swarm')) return json(res, 400, { ok: false, error: 'no active browser run' });
-      const n = Math.max(1, Math.min(60, Number(u.searchParams.get('n')) || 25));
-      const start = run.cursor;
-      const names = [];
-      while (names.length < n && run.cursor < run.total) {
-        names.push(nameAt(run.target, run.order, run.cursor++));
-      }
-      return json(res, 200, { names, start, next: run.cursor, total: run.total, done: run.cursor >= run.total });
-    }
-
-    if (req.method === 'GET' && p === '/api/swarm') {
-      return json(res, 200, {
-        available: !!detectPlaywright(),
-        browser: detectBrowser(),
-        error: swarm.lastError || null,
-        mode: swarm.running ? 'playwright' : 'idle',
-        meta: swarm.running ? swarm.meta() : null,
-      });
-    }
-
-    if (req.method === 'GET' && /^\/api\/cam\/([1-6])\.jpg$/.test(p)) {
-      const n = Number(p.match(/^\/api\/cam\/([1-6])\.jpg$/)[1]);
-      const buf = swarm.camOf(n);
-      if (!buf) { res.writeHead(204); return res.end(); }
+    if (req.method === 'GET' && /^\/api\/cam\/[1-6]\.jpg$/.test(p)) {
+      const n = Number(p.match(/\/api\/cam\/([1-6])\.jpg$/)[1]);
+      const buf = siteSniper.camOf(n);
+      if (!buf) { res.writeHead(204, { 'cache-control': 'no-store' }); return res.end(); }
       res.writeHead(200, { 'content-type': 'image/jpeg', 'cache-control': 'no-store' });
       return res.end(buf);
     }
 
-    if (req.method === 'GET' && p === '/api/hits.txt') {
-      const lines = run ? run.available : [];
+    if (req.method === 'GET' && p === '/api/snipes.txt') {
+      const lines = run ? run.snipes.map(s => `@${s.name}\t${new Date(s.at).toISOString()}\t${s.via}`) : [];
       res.writeHead(200, {
         'content-type': 'text/plain; charset=utf-8',
-        'content-disposition': `attachment; filename="snipr_hits_${run ? run.platform : 'none'}.txt"`,
+        'content-disposition': 'attachment; filename="snipr_sniped.txt"',
       });
       return res.end(lines.join('\n'));
     }
 
-    if (req.method === 'GET' && p === '/api/health') return json(res, 200, { ok: true, uptime: process.uptime() });
-
-    // --- rotating proxy layer (Tor circuits / proxy list) -------------------
-    if (req.method === 'GET' && p === '/api/net') {
-      return json(res, 200, { ok: true, proxy: proxyPool.status(), tor: torLayer.status() });
-    }
-
-    if (req.method === 'POST' && p === '/api/net/check') {
-      const route = await proxyPool.checkRoute();
-      return json(res, 200, { ok: route.ok, route, proxy: proxyPool.status(), tor: torLayer.status() });
-    }
-
-    /* Start/stop a local Tor daemon (lib/tor.js). One click has to be enough:
-     * with no `tor` binary on the host we fetch the official Tor Expert Bundle
-     * ourselves (lib/torbundle.js), so this call can take ~30s on the first use
-     * (32 MB download + bootstrap). `install:false` skips the download, and
-     * `action:'status'` is cheap — the dashboard polls it while a start runs. */
-    if (req.method === 'POST' && p === '/api/net/tor') {
+    // A pasted message can be pasted back in to see how it would be read.
+    if (req.method === 'POST' && p === '/api/parse') {
       const body = await readBody(req);
-      const action = String(body.action || 'status').toLowerCase();
-      try {
-        if (action === 'stop') {
-          const stopped = await torLayer.stop();
-          return json(res, 200, { ok: true, stopped, tor: torLayer.status(), proxy: proxyPool.status() });
-        }
-        if (action === 'start') {
-          const started = await torLayer.start({
-            socksPort: Number(body.socksPort) || undefined,
-            allowDownload: body.install !== false,
-          });
-          if (!started.ok) return json(res, 200, { ok: false, error: started.error, started, tor: torLayer.status(), proxy: proxyPool.status() });
-          const proxy = proxyPool.setConfig({
-            mode: 'tor',
-            torSocks: started.socks,
-            torControl: started.control || '',
-            torPassword: started.password || '',
-          });
-          const route = await proxyPool.checkRoute();
-          return json(res, 200, { ok: route.ok, started, route, tor: torLayer.status(), proxy });
-        }
-        return json(res, 200, { ok: true, tor: torLayer.status(), proxy: proxyPool.status() });
-      } catch (e) {
-        return json(res, 200, { ok: false, error: String(e.message || e).slice(0, 240), tor: torLayer.status(), proxy: proxyPool.status() });
-      }
+      const out = analyzeSiteText(String(body.text || ''));
+      return json(res, 200, { ok: true, ...out });
     }
 
-    if (req.method === 'POST' && p === '/api/net') {
-      const body = await readBody(req);
-      try {
-        const proxy = proxyPool.setConfig(body);
-        const route = await proxyPool.checkRoute();   // prove the new route dials
-        return json(res, 200, { ok: true, proxy, route, tor: torLayer.status() });
-      } catch (e) {
-        return json(res, 400, { ok: false, error: String(e.message || e), proxy: proxyPool.status(), tor: torLayer.status() });
-      }
-    }
-
-    if (req.method === 'POST' && p === '/api/net/test') {
-      // proves the current config end to end: one real request through the
-      // proxy to check.torproject.org, which answers with the exit IP
-      try {
-        const out = await exitCheck(20000);
-        return json(res, 200, { ok: !!out.ok, ...out, proxy: proxyPool.status() });
-      } catch (e) {
-        return json(res, 200, { ok: false, error: String(e.message || e).slice(0, 200), proxy: proxyPool.status() });
-      }
-    }
-
-
-    if (req.method === 'GET') return serveStatic(req, res, p);
-    json(res, 404, { ok: false, error: 'not found' });
+    if (p.startsWith('/api/')) return json(res, 404, { ok: false, error: `unknown endpoint ${p}` });
+    if (req.method === 'GET') return serveStatic(res, p);
+    return json(res, 404, { ok: false, error: 'not found' });
   } catch (e) {
-    json(res, 500, { ok: false, error: String(e.message || e) });
+    return json(res, 500, { ok: false, error: String(e.message || e) });
   }
 });
 
 server.listen(PORT, HOST, () => {
+  const rep = browserReport();
   console.log(`[SNIPR] listening on http://${HOST}:${PORT}`);
-  const pw = detectPlaywright();
-  const browser = detectBrowser();
-  console.log(`[SNIPR] engines: server | browser | swarm — real checks only (no demo)`);
-  console.log(`[SNIPR] playwright: ${pw ? 'yes' : 'no'} · real browser: ${browser || 'none found (swarm falls back to 6 in-browser workers)'}`);
-  const proxy = proxyPool.initFromEnv();
-  console.log(`[SNIPR] proxy: ${proxy.label}`);
+  console.log(`[SNIPR] real browsers: ${rep.browsers.length ? rep.browsers.join(', ') : 'NONE — ' + rep.error}`);
+  console.log(`[SNIPR] flows: ${Object.values(FLOWS).map(f => `${f.label} -> ${f.site}`).join(' | ')}`);
+  const login = siteSniper.loginState();
+  console.log(`[SNIPR] account: ${login.env ? 'USERSNIPER_EMAIL/USERSNIPER_PASSWORD from the environment' : 'nothing stored yet — paste it in the dashboard (memory only)'}`);
 });

@@ -3,204 +3,174 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>SNIPR — guns.lol / Discord / IG / TikTok username sniper</title>
+<title>SNIPR — six real browsers, real snipes</title>
 <link rel="stylesheet" href="/style.css">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='80' font-size='80'>🎯</text></svg>">
 </head>
 <body>
-<header>
-  <div class="logo">SNIP<span>R</span></div>
-  <div class="tagline">multi-platform username sniper · <b>guns.lol</b> · <b>Discord</b> · <b>Instagram</b> · <b>TikTok</b></div>
-  <div class="engine-live" id="netBadge" title="outbound status of the server running this app">● checking network…</div>
+<div class="bg" aria-hidden="true"></div>
+
+<header class="top">
+  <div class="brand">
+    <span class="mark">◎</span>
+    <span class="word">SNIP<span class="r">R</span></span>
+    <em>real-browser sniper console</em>
+  </div>
+  <div class="chips">
+    <span class="chip" id="chipState"><i class="dot"></i><b>idle</b></span>
+    <span class="chip" id="chipBrowser" title="the browser SNIPR will launch">browser: …</span>
+    <span class="chip" id="chipSite" title="can this machine reach the sniper site?">site: …</span>
+    <span class="chip" id="chipAccount" title="account used to sign the browsers in">account: none</span>
+  </div>
 </header>
 
-<main>
-  <!-- ============================ CONFIG ============================ -->
-  <section class="card config">
-    <h2>1 · Pick platform</h2>
-    <div class="platforms" id="platforms">
-      <button class="platform" data-platform="gunslol">
-        <span class="p-icon">🔫</span><span class="p-name">guns.lol</span>
-        <span class="p-note">bio-link OG names</span>
-      </button>
-      <button class="platform" data-platform="discord">
-        <span class="p-icon">🎮</span><span class="p-name">Discord</span>
-        <span class="p-note">Pomelo unauthed API</span>
-      </button>
-      <button class="platform" data-platform="instagram">
-        <span class="p-icon">📸</span><span class="p-name">Instagram</span>
-        <span class="p-note">web_profile_info</span>
-      </button>
-      <button class="platform" data-platform="tiktok">
-        <span class="p-icon">🎵</span><span class="p-name">TikTok</span>
-        <span class="p-note">unique/id/check API</span>
-      </button>
-    </div>
-
-    <h2>2 · Pick targets</h2>
-    <div class="tabs">
-      <button class="tab active" data-tab="pattern">Pattern (3L / 3C / 4L / 4C)</button>
-      <button class="tab" data-tab="list">Custom list</button>
-    </div>
-
-    <div id="tab-pattern">
-      <div class="chips">
-        <button class="chip" data-len="3" data-charset="L">
-          <b>3L</b><i>3 letters</i><em>26³ = <span>17,576</span></em>
-        </button>
-        <button class="chip" data-len="3" data-charset="C">
-          <b>3C</b><i>3 chars a-z0-9</i><em>36³ = <span>46,656</span></em>
-        </button>
-        <button class="chip" data-len="4" data-charset="L">
-          <b>4L</b><i>4 letters</i><em>26⁴ = <span>456,976</span></em>
-        </button>
-        <button class="chip" data-len="4" data-charset="C">
-          <b>4C</b><i>4 chars a-z0-9</i><em>36⁴ = <span>1,679,616</span></em>
-        </button>
-      </div>
-      <details class="custom-len">
-        <summary>Custom length / charset</summary>
-        <div class="row">
-          <label>Length <b id="lenVal">5</b>
-            <input type="range" id="lenRange" min="1" max="6" value="5">
-          </label>
-          <label class="chk"><input type="checkbox" id="useLetters" checked> letters a-z</label>
-          <label class="chk"><input type="checkbox" id="useDigits" checked> digits 0-9</label>
-          <output id="customCount">—</output>
-        </div>
-      </details>
-    </div>
-
-    <div id="tab-list" hidden>
-      <textarea id="nameList" rows="6" placeholder="paste usernames, one per line (or comma separated)&#10;e.g. owner&#10;purz&#10;k4ito&#10;zz9"></textarea>
-      <div class="muted" id="listCount">0 usernames</div>
-    </div>
-
-    <h2>3 · Engine & speed</h2>
-    <div class="row engines">
-      <label>Engine
-        <select id="engine">
-          <option value="server">Server (real checks from this machine)</option>
-          <option value="browser">Browser-direct (real checks from your browser)</option>
-          <option value="swarm">⚡ SWARM — 6 real browsers, same time</option>
-        </select>
-      </label>
-      <label>Threads <b id="concVal">8</b>
-        <input type="range" id="concurrency" min="1" max="24" value="8">
-      </label>
-      <label>Delay/req <b id="delayVal">150ms</b>
-        <input type="range" id="delay" min="0" max="2000" step="25" value="150">
-      </label>
-      <label class="chk"><input type="checkbox" id="shuffle" checked> shuffled order</label>
-    </div>
-    <p class="muted small" id="engineNote"></p>
-
-    <h2>4 · Exit IP — rotating Tor / proxies</h2>
-    <div class="row">
-      <label>Route
-        <select id="proxyMode">
-          <option value="off">Direct — this machine's IP</option>
-          <option value="tor">🧅 Tor — rotating circuits</option>
-          <option value="list">Proxy list — round-robin</option>
-        </select>
-      </label>
-      <label class="chk tor-only"><input type="checkbox" id="torIsolate" checked> fresh circuit per request</label>
-      <label class="tor-only">SOCKS5 (Tor)
-        <input type="text" id="torSocks" value="socks5://127.0.0.1:9050" spellcheck="false">
-      </label>
-      <label class="tor-only">Control port
-        <input type="text" id="torControl" value="127.0.0.1:9051" spellcheck="false">
-      </label>
-      <label class="chk tor-only"><input type="checkbox" id="torPasswordChk"> control password</label>
-      <label class="tor-only" hidden>Tor password
-        <input type="password" id="torPassword" placeholder="HashedControlPassword" spellcheck="false">
-      </label>
-      <label class="tor-only">New identity every <b id="rotEveryVal">1</b> req
-        <input type="range" id="rotEvery" min="0" max="50" value="1">
-      </label>
-      <label class="tor-only">min gap (s)
-        <input type="text" inputmode="numeric" id="rotInterval" value="10">
-      </label>
-    </div>
-    <div class="row tor-only">
-      <span id="torDaemon" class="muted small">🧅 Tor: checking…</span>
-      <button id="torStart" title="download the official Tor bundle (~32 MB, once) and run it">▶ start Tor</button>
-      <button id="torStop" title="stop the Tor daemon this app started">■ stop Tor</button>
-    </div>
-    <p class="muted small tor-only" id="torNote">
-      ▶ start Tor needs no setup: if this host has no <code>tor</code>, the app downloads the official Tor Expert
-      Bundle (~32 MB, once), checks it against the SHA-256 published by the Tor Project, and runs it from its own
-      cache. Kept between starts, never installed system-wide.
+<section class="hero">
+  <div class="hero-copy">
+    <h1>Six real browsers.<br><span class="glow">Whatever it snipes, you see it.</span></h1>
+    <p>
+      SNIPR opens <b>six real Chromium browsers</b> on <b id="heroSite">usersniper.com</b>, signs them into your
+      account, and walks the flow for you: <b>Names</b> tab → pick the pattern → wait for the names to load →
+      <b>Randomize</b> → the platform's <b>Sniper</b> tab → <b>Start</b>. Each browser streams a live cam, and the
+      <b>Sniped</b> panel shows the name the site itself reported — never the name it was trying for.
     </p>
-    <textarea id="proxyList" rows="3" spellcheck="false" hidden placeholder="one proxy per line:&#10;socks5://user:pass@127.0.0.1:1080&#10;http://user:pass@proxy.example:8080"></textarea>
-    <div class="row">
-      <button id="netApply">apply route</button>
-      <button id="netTest">test exit IP</button>
-      <span class="muted small" id="netStatus">direct — this machine's IP</span>
+    <div class="hero-actions">
+      <button id="startBtn" class="btn primary big">▶ START SNIPING</button>
+      <button id="stopBtn" class="btn danger big" disabled>■ STOP</button>
+      <span class="hint" id="startHint"></span>
     </div>
-    <p class="muted small" id="netHint"></p>
-    <p id="netSuggest" hidden></p>
+    <ul class="facts">
+      <li><b>Real</b><span>real browsers, real page loads — no demo mode anywhere</span></li>
+      <li><b>6 cams</b><span>one live screenshot per browser, ~1 fps</span></li>
+      <li><b>6 × the flow</b><span>each browser runs the whole sequence itself</span></li>
+      <li><b>True report</b><span>reads the site's own success messages</span></li>
+    </ul>
+  </div>
+</section>
 
-    <div class="row actions">
-      <button id="startBtn" class="primary">▶ START SNIPING</button>
-      <button id="stopBtn" class="danger" disabled>■ STOP</button>
-      <span class="muted" id="startHint"></span>
-    </div>
-    <p class="muted small" id="runError" hidden></p>
-    <p class="muted small" id="runThrottle" hidden></p>
+<main class="grid">
+  <!-- ------------------------------ controls ------------------------------ -->
+  <div class="col">
+    <section class="panel">
+      <h2><span>1</span> Platform</h2>
+      <div class="platforms" id="platforms"></div>
+      <p class="muted small" id="platformNote">—</p>
+    </section>
 
-    <details class="single">
-      <summary>Check a single username</summary>
+    <section class="panel">
+      <h2><span>2</span> Pattern</h2>
+      <div class="chips-rows" id="patterns"></div>
+      <label class="field">Or type it exactly as the site labels it
+        <input id="patternCustom" placeholder="4C" maxlength="12" spellcheck="false">
+      </label>
+      <p class="muted small" id="patternNote">—</p>
+      <p class="muted small">Whatever is selected here is what SNIPR clicks: the label is matched against the site's visible text, exact first.</p>
+    </section>
+
+    <section class="panel">
+      <h2><span>3</span> Browsers</h2>
+      <label class="field">How many real browsers <b id="browsersVal">6</b>
+        <input type="range" id="browsers" min="1" max="6" value="6">
+      </label>
+      <label class="switch"><input type="checkbox" id="headful"> show the browser windows (needs a desktop session)</label>
       <div class="row">
-        <input type="text" id="singleName" placeholder="username…">
-        <button id="singleBtn">check</button>
-        <span id="singleOut" class="pill">—</span>
+        <button id="verifyBtn" class="btn ghost small">test a real browser launch</button>
+        <button id="probeBtn" class="btn ghost small">probe the site from this machine</button>
       </div>
+      <p class="muted small" id="verifyOut">not tested yet — this actually starts a browser and closes it again</p>
+      <p class="muted small" id="probeOut">site not probed yet</p>
+    </section>
+
+    <section class="panel">
+      <h2><span>4</span> Your account</h2>
+      <p class="muted small">
+        Used to sign the browsers in to <b>your own</b> account. Held in this process's memory only, never written to
+        disk, sent nowhere except the site's own login form. SNIPR never registers accounts.
+      </p>
+      <label class="field">Email / username <input id="loginEmail" autocomplete="off" spellcheck="false"></label>
+      <label class="field">Password <input id="loginPassword" type="password" autocomplete="new-password"></label>
+      <div class="row">
+        <button id="loginBtn" class="btn ghost small">store for this run</button>
+        <span class="muted small" id="loginOut">nothing stored yet</span>
+      </div>
+    </section>
+
+    <details class="panel">
+      <summary><h2><span>5</span> Advanced — the site and its tab labels</h2></summary>
+      <label class="field">Sniper site <input id="siteUrl" spellcheck="false"></label>
+      <label class="field">Names tab label <input id="namesTab" placeholder="Names" spellcheck="false"></label>
+      <label class="field">Sniper tab label <input id="sniperTab" placeholder="Discord Sniper" spellcheck="false"></label>
+      <p class="muted small">
+        Every control is found by its visible text, so if the site renames a tab (or you point SNIPR at another sniper)
+        type the label here and it will be used instead.
+      </p>
     </details>
-  </section>
 
-  <!-- ============================ STATS ============================= -->
-  <section class="card stats">
-    <h2 id="runTitle">Run stats <span class="muted" id="runDesc">— no run yet</span></h2>
-    <div class="progress"><div id="progressBar"></div></div>
-    <div class="tiles">
-      <div class="tile"><em>possibilities</em><b id="stTotal">0</b></div>
-      <div class="tile"><em>checked</em><b id="stChecked">0</b></div>
-      <div class="tile ok"><em>valid (free)</em><b id="stValid">0</b></div>
-      <div class="tile bad"><em>taken</em><b id="stTaken">0</b></div>
-      <div class="tile warn"><em>invalid</em><b id="stInvalid">0</b></div>
-      <div class="tile prem"><em>premium 💎</em><b id="stPremium">0</b></div>
-      <div class="tile warn"><em>errors</em><b id="stErrors">0</b></div>
-      <div class="tile hl"><em>left to check</em><b id="stLeft">0</b></div>
-      <div class="tile"><em>speed /min</em><b id="stRate">0</b></div>
-      <div class="tile"><em>ETA</em><b id="stEta">—</b></div>
-    </div>
+    <p id="runError" class="alert" hidden></p>
+  </div>
 
-    <div class="feed-head">
-      <div class="tabs small">
-        <button class="tab active" data-feed="all">All</button>
-        <button class="tab" data-feed="available">Valid ✅</button>
-        <button class="tab" data-feed="taken">Taken ❌</button>
-        <button class="tab" data-feed="error">Errors ⚠</button>
+  <!-- ------------------------------- output ------------------------------- -->
+  <div class="col">
+    <section class="panel sniped-panel">
+      <h2><span>🎯</span> Sniped <em id="snipedCount">0</em></h2>
+      <div id="sniped" class="sniped-list">
+        <p class="muted empty">nothing yet — the name the site reports as claimed lands here, with the exact line it came from</p>
       </div>
-      <div class="feed-actions">
-        <button id="copyHits" title="copy valid usernames">⧉ copy valid</button>
-        <a id="dlHits" href="/api/hits.txt" download>⬇ hits.txt</a>
+      <div class="row">
+        <button id="copySnipes" class="btn ghost small">⧉ copy names</button>
+        <a class="btn ghost small" href="/api/snipes.txt" download>⬇ sniped.txt</a>
+        <span class="muted small" id="snipedNote"></span>
       </div>
-    </div>
-    <div class="feed" id="feed"><div class="muted empty">start a run to see results stream in…</div></div>
-  </section>
+    </section>
+
+    <section class="panel">
+      <h2><span>≡</span> Flow</h2>
+      <ol class="timeline" id="timeline"><li class="muted small">press START SNIPING to walk the flow</li></ol>
+    </section>
+
+    <section class="panel">
+      <h2><span>▦</span> Browser status</h2>
+      <div class="workers" id="workers"></div>
+    </section>
+
+    <section class="panel">
+      <h2><span>✓</span> Site says available <em id="foundCount">0</em></h2>
+      <div id="found" class="found-list">
+        <p class="muted empty">available names the site mentioned are listed here — kept apart from snipes, because "available" is not "sniped"</p>
+      </div>
+    </section>
+
+    <details class="panel">
+      <summary><h2><span>&gt;_</span> Site traffic — what the site actually said</h2></summary>
+      <div id="tap" class="tap"><p class="muted empty">nothing yet</p></div>
+      <p class="muted small">
+        Every fetch/XHR/WebSocket frame and rendered line the site produced. If the “Sniped” panel stays empty while
+        the site does claim names, the wording is different than expected — this panel shows it verbatim so it can be
+        taught in one line.
+      </p>
+    </details>
+
+    <section class="panel">
+      <h2><span>⏱</span> Run</h2>
+      <div class="tiles" id="tiles"></div>
+      <ol class="steps-log" id="stepsLog"></ol>
+    </section>
+  </div>
 </main>
 
-<!-- ============================ LIVE CAM =========================== -->
-<section class="card camwall" id="camwall">
-  <h2>LIVE CAM — 6 real browsers sniping <span class="muted" id="camMode">· idle</span></h2>
+<section class="panel camwall">
+  <h2><span>◉</span> LIVE CAM — six real browsers <em id="camMode">idle</em></h2>
   <div class="cams" id="cams"></div>
 </section>
 
 <footer>
-  <span>tor rotation: per-request SOCKS5 circuit isolation + <b>SIGNAL NEWNYM</b> · checkers ported from open-source GitHub tools: <b>xnxv/guns.lol.scanner</b> · <b>M58-ENSIBS/guns.lol-fetcher</b> · <b>daskeptaxd/username-checker</b> · <b>swagkarna/TikTok-Username-Checker</b> · <b>efekrbas/guns.lol-username-checker</b> (2026, browser detection + premium filter) · <b>CuteTenshii/guns-solver</b> (2026, cf_clearance intel) — see README</span>
-  <span class="muted">educational tool — respect each platform's ToS, keep delays on, don't hammer</span>
+  <span>
+    <b>SNIPR</b> drives real Chromium browsers through the site's own UI. An account you already own is required —
+    SNIPR never creates one.
+  </span>
+  <span class="muted">
+    Username sniping can violate a platform's terms of service and claiming names you don't intend to use is not
+    okay. Use your own accounts, keep browser counts sane, and don't hammer anyone's site.
+  </span>
 </footer>
 
 <script src="/app.js"></script>
